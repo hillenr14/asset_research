@@ -154,14 +154,21 @@ def adj_close_analysis(ticker, start_date):
     info, _ = get_info(ticker)
     if not info: return None, None
     
-    end_date = date.today()
-    df = get_history(ticker, start_date, end_date)
+    # Use date.today() as the end date for fetching history
+    end_date_fetch = date.today()
+    df = get_history(ticker, start_date, end_date_fetch)
     if df.empty: return None, None
+
+    # Determine actual start and end dates from the fetched data
+    actual_start_date = df.index.min().strftime('%Y-%m-%d')
+    actual_end_date = df.index.max().strftime('%Y-%m-%d')
 
     fundamentals_df = pd.DataFrame({"Price": info.get("regularMarketPrice"), "Dividend Yield (%)": info.get("dividendYield", 0), "Trailing P/E": info.get("trailingPE"), "Asset Type": info.get("quoteType")}.items(), columns=["Field", ticker]).set_index("Field")
     
     returns = df[['Close', 'Adj Close']].pct_change().fillna(0.0)
     return_1y = returns.mean() * 252
+    fundamentals_df.loc['Start Date', ticker] = actual_start_date
+    fundamentals_df.loc['End Date', ticker] = actual_end_date
     fundamentals_df.loc['Annual Return (%)', ticker] = return_1y["Close"] * 100
     fundamentals_df.loc['Annual Return Adj (%)', ticker] = return_1y["Adj Close"] * 100
     stdev_1y = returns.std() * np.sqrt(252)
@@ -210,12 +217,28 @@ def format_df_for_display(df):
                 display_df.loc[idx, col] = str(value)
     return display_df
 
-def get_display_fundamentals(ticker):
+def get_display_fundamentals(ticker, start_date):
     """Helper to get a formatted fundamentals table for a single ticker."""
     info, _ = get_info(ticker)
     if not info: return None
 
-    funda_data = {"Price": info.get("regularMarketPrice"), "Dividend Yield (%)": info.get("dividendYield", 0), "Trailing P/E": info.get("trailingPE"), "Asset Type": info.get("quoteType")}
+    end_date_fetch = date.today()
+    df = get_history(ticker, start_date, end_date_fetch)
+    if df.empty:
+        actual_start_date = "N/A"
+        actual_end_date = "N/A"
+    else:
+        actual_start_date = df.index.min().strftime('%Y-%m-%d')
+        actual_end_date = df.index.max().strftime('%Y-%m-%d')
+
+    funda_data = {
+        "Price": info.get("regularMarketPrice"), 
+        "Dividend Yield (%)": info.get("dividendYield", 0), 
+        "Trailing P/E": info.get("trailingPE"), 
+        "Asset Type": info.get("quoteType"),
+        "Start Date": actual_start_date,
+        "End Date": actual_end_date
+    }
     
     funda_df = pd.DataFrame(funda_data.items(), columns=["Field", "Value"]).set_index("Field")
     
@@ -304,7 +327,7 @@ for i, ticker in enumerate(st.session_state.pe_tickers_list, 1):
         col1, col2 = st.columns([0.5, 2])
         with col1:
             st.subheader("Fundamentals")
-            funda_df = get_display_fundamentals(ticker)
+            funda_df = get_display_fundamentals(ticker, pe_start_date_input)
             if funda_df is not None:
                 st.dataframe(funda_df)
             else:
