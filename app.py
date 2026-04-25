@@ -15,6 +15,7 @@ st.title("Stock Analysis")
 
 # --- CONFIGURATION & PERSISTENCE ---
 CONFIG_FILE = "config.json"
+HISTORY_CACHE_DIR = "cache/history"
 
 def load_config():
     """Loads configuration from config.json."""
@@ -39,6 +40,83 @@ def save_config(config):
         json.dump(config_to_save, f, indent=4)
 
 # --- ANALYSIS FUNCTIONS (with caching) ---
+
+def _history_cache_path(ticker):
+    os.makedirs(HISTORY_CACHE_DIR, exist_ok=True)
+    return os.path.join(HISTORY_CACHE_DIR, f"{ticker.upper()}.pkl")
+
+def _normalize_history_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    normalized = df.copy()
+    normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+    normalized = normalized[~normalized.index.isna()]
+    if getattr(normalized.index, "tz", None) is not None:
+        normalized.index = normalized.index.tz_localize(None)
+    normalized.index = normalized.index.normalize()
+    normalized = normalized[~normalized.index.duplicated(keep="last")].sort_index()
+    return normalized
+
+def _read_history_cache(ticker):
+    cache_path = _history_cache_path(ticker)
+    if not os.path.exists(cache_path):
+        return pd.DataFrame()
+    try:
+        return _normalize_history_df(pd.read_pickle(cache_path))
+    except Exception:
+        # If cache is corrupted or unreadable, refetch from source.
+        return pd.DataFrame()
+
+def _write_history_cache(ticker, df):
+    cache_path = _history_cache_path(ticker)
+    _normalize_history_df(df).to_pickle(cache_path)
+
+def _download_history_range(ticker, start_date=None, end_date=None):
+    if start_date is not None and end_date is not None and start_date >= end_date:
+        return pd.DataFrame()
+    fetched = yf.Ticker(ticker).history(start=start_date, end=end_date, auto_adjust=False)
+    return _normalize_history_df(fetched)
+
+def _update_history_cache(ticker, request_start=None, request_end=None):
+    """Ensures cached data covers [request_start, request_end] and returns full cached frame."""
+    requested_start = pd.Timestamp(request_start).normalize() if request_start is not None else None
+    requested_end = pd.Timestamp(request_end).normalize() if request_end is not None else pd.Timestamp(date.today()).normalize()
+    if requested_start is not None and requested_start > requested_end:
+        return pd.DataFrame()
+
+    cached_df = _read_history_cache(ticker)
+    pieces = [cached_df] if not cached_df.empty else []
+
+    if cached_df.empty:
+        if requested_start is None:
+            fetched = yf.Ticker(ticker).history(period="max", auto_adjust=False)
+            pieces.append(_normalize_history_df(fetched))
+        else:
+            # yfinance end is exclusive; add one day so the requested end date is included.
+            fetched = _download_history_range(ticker, requested_start, requested_end + pd.Timedelta(days=1))
+            pieces.append(fetched)
+    else:
+        cached_start = cached_df.index.min().normalize()
+        cached_end = cached_df.index.max().normalize()
+
+        if requested_start is not None and requested_start < cached_start:
+            older = _download_history_range(ticker, requested_start, cached_start)
+            if not older.empty:
+                pieces.append(older)
+
+        if requested_end > cached_end:
+            newer_start = cached_end + pd.Timedelta(days=1)
+            newer = _download_history_range(ticker, newer_start, requested_end + pd.Timedelta(days=1))
+            if not newer.empty:
+                pieces.append(newer)
+
+    if not pieces:
+        return pd.DataFrame()
+
+    merged = _normalize_history_df(pd.concat(pieces))
+    _write_history_cache(ticker, merged)
+    return merged
+
 @st.cache_data
 def get_info(ticker):
     stock = yf.Ticker(ticker)
@@ -46,21 +124,27 @@ def get_info(ticker):
     if not info or 'regularMarketPrice' not in info or info.get('regularMarketPrice') is None: return None, None
     return info, stock.quarterly_income_stmt
 
-@st.cache_data
 def get_history(ticker, start_date, end_date):
-    return yf.Ticker(ticker).history(start=start_date, end=end_date, auto_adjust=False)
+    full_history = _update_history_cache(ticker, start_date, end_date)
+    if full_history.empty:
+        return full_history
 
-@st.cache_data
-def get_daily_price(ticker):
-    price = yf.Ticker(ticker).history(period="max", auto_adjust=False)["Close"].dropna()
-    price.index = pd.to_datetime(price.index).tz_localize(None)
+    start_ts = pd.Timestamp(start_date).normalize() if start_date is not None else full_history.index.min()
+    end_ts = pd.Timestamp(end_date).normalize() if end_date is not None else full_history.index.max()
+    return full_history.loc[(full_history.index >= start_ts) & (full_history.index <= end_ts)].copy()
+
+def get_daily_price(ticker, start_date):
+    full_history = _update_history_cache(ticker, request_start=start_date, request_end=date.today())
+    if full_history.empty or "Close" not in full_history.columns:
+        return pd.Series(dtype=float)
+    price = full_history["Close"].dropna()
     return price
 
 # --- PLOTTING & CALCULATION LOGIC ---
 
 def ps_ratio_analysis(ticker, plot_start_date):
     info, q_inc = get_info(ticker)
-    price = get_daily_price(ticker)
+    price = get_daily_price(ticker, plot_start_date)
     if q_inc is None or q_inc.empty: raise ValueError("Quarterly income statement data not available.")
     
     q_inc.columns = pd.to_datetime(q_inc.columns).tz_localize(None)
@@ -106,7 +190,7 @@ def ps_ratio_analysis(ticker, plot_start_date):
 
 def pe_ratio_analysis(ticker, plot_start_date):
     info, q_inc = get_info(ticker)
-    price = get_daily_price(ticker)
+    price = get_daily_price(ticker, plot_start_date)
     if q_inc is None or q_inc.empty: raise ValueError("Quarterly income statement data not available.")
     
     q_inc.columns = pd.to_datetime(q_inc.columns).tz_localize(None)
