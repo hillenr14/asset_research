@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -9,6 +10,11 @@ import yfinance as yf
 
 from errors import InvalidTickerError, ProviderError
 from models import TickerSnapshot
+
+
+CACHE_DIR = Path(".cache/price_history")
+CACHE_EXTENSION = ".csv"
+CACHE_TTL_SECONDS = 86400
 
 
 def _safe_float(value: Any) -> float | None:
@@ -62,6 +68,78 @@ def _normalize_history_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
     return normalized.sort_index()
 
 
+def _cache_path_for(symbol: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / f"{symbol.lower()}{CACHE_EXTENSION}"
+
+
+def _read_cached_history(symbol: str) -> pd.DataFrame:
+    path = _cache_path_for(symbol)
+    if not path.exists():
+        return pd.DataFrame(columns=["Close", "Adj Close", "Dividends"])
+
+    try:
+        cached = pd.read_csv(path, index_col=0, parse_dates=True)
+    except Exception:
+        return pd.DataFrame(columns=["Close", "Adj Close", "Dividends"])
+
+    return _normalize_history_frame(cached)
+
+
+def _write_cached_history(symbol: str, history: pd.DataFrame) -> None:
+    path = _cache_path_for(symbol)
+    history_to_save = history.copy()
+    history_to_save.index = pd.to_datetime(history_to_save.index).tz_localize(None)
+    history_to_save.to_csv(path)
+
+
+def _download_history_segment(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+    fetch_end = end_date + timedelta(days=1)
+    return _normalize_history_frame(
+        yf.Ticker(symbol).history(start=start_date, end=fetch_end, auto_adjust=False)
+    )
+
+
+def _slice_history(history: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
+    if history.empty:
+        return history
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    return history.loc[(history.index >= start_ts) & (history.index <= end_ts)].copy()
+
+
+def _refresh_cached_history(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+    cached = _read_cached_history(symbol)
+
+    segments: list[pd.DataFrame] = []
+    if not cached.empty:
+        cached = _slice_history(cached, min(start_date, cached.index.min().date()), end_date)
+
+    if cached.empty:
+        refreshed = _download_history_segment(symbol, start_date, end_date)
+        if not refreshed.empty:
+            _write_cached_history(symbol, refreshed)
+        return _slice_history(refreshed, start_date, end_date)
+
+    cached_start = cached.index.min().date()
+    cached_end = cached.index.max().date()
+
+    if start_date < cached_start:
+        segments.append(_download_history_segment(symbol, start_date, cached_start - timedelta(days=1)))
+
+    if cached_end < end_date:
+        update_start = max(start_date, cached_end - timedelta(days=7))
+        segments.append(_download_history_segment(symbol, update_start, end_date))
+
+    if segments:
+        combined = pd.concat([cached] + [segment for segment in segments if not segment.empty], axis=0)
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        _write_cached_history(symbol, combined)
+        cached = combined
+
+    return _slice_history(cached, start_date, end_date)
+
+
 def _extract_fast_info(stock: yf.Ticker) -> dict[str, Any]:
     try:
         fast_info = stock.fast_info
@@ -112,7 +190,7 @@ def _build_snapshot(ticker: str, info: dict[str, Any], fast_info: dict[str, Any]
     )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame]:
     symbol = ticker.strip().upper()
     try:
@@ -142,13 +220,11 @@ def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame]:
     return snapshot, quarterly_income_stmt
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_price_history(ticker: str, start_date: date, end_date: date) -> pd.DataFrame:
     symbol = ticker.strip().upper()
     try:
-        return _normalize_history_frame(
-            yf.Ticker(symbol).history(start=start_date, end=end_date, auto_adjust=False)
-        )
+        return _refresh_cached_history(symbol, start_date, end_date)
     except Exception as exc:
         raise ProviderError(
             f"Could not retrieve price history for {symbol}.",
@@ -156,16 +232,14 @@ def get_price_history(ticker: str, start_date: date, end_date: date) -> pd.DataF
         ) from exc
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_daily_close_history(ticker: str) -> pd.Series:
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def get_daily_close_history(ticker: str, start_date: date, end_date: date) -> pd.Series:
     symbol = ticker.strip().upper()
     try:
-        history = _normalize_history_frame(
-            yf.Ticker(symbol).history(period="max", auto_adjust=False)
-        )
+        history = _refresh_cached_history(symbol, start_date, end_date)
     except Exception as exc:
         raise ProviderError(
-            f"Could not retrieve long-term daily prices for {symbol}.",
+            f"Could not retrieve daily prices for {symbol}.",
             str(exc),
         ) from exc
 

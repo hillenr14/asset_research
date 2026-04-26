@@ -207,7 +207,7 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
         history = get_price_history(ticker, start_date, date.today())
         if history.empty:
             raise MissingDataError(f"No price history is available for {ticker} in the selected date range.")
-        price_series = get_daily_close_history(ticker)
+        price_series = get_daily_close_history(ticker, start_date, date.today())
         fundamentals = _build_fundamentals(snapshot, history)
     except Exception as exc:
         return ValuationAnalysisResult(ticker=ticker, issue=to_issue(exc))
@@ -248,8 +248,6 @@ def fundamentals_to_frame(fundamentals_list: list[Fundamentals]) -> pd.DataFrame
         ("Dividend Yield (%)", "dividend_yield"),
         ("Trailing P/E", "trailing_pe"),
         ("Asset Type", "asset_type"),
-        ("Start Date", "start_date"),
-        ("End Date", "end_date"),
         ("Annual Return (%)", "annual_return_pct"),
         ("Annual Return Adj (%)", "annual_return_adj_pct"),
         ("Annual Volatility (%)", "annual_volatility_pct"),

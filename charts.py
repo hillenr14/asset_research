@@ -16,16 +16,36 @@ def _apply_plotly_layout(
 ) -> go.Figure:
     layout = dict(
         title=title,
-        template="plotly_white",
+        template="plotly",
         hovermode="x unified",
         height=600,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#142033",
+        font=dict(color="#e2e8f0"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=70, r=70, t=90, b=60),
-        xaxis=dict(title="Date", showgrid=True, gridcolor="rgba(0, 0, 0, 0.12)"),
-        yaxis=dict(title=left_title, showgrid=True, gridcolor="rgba(0, 0, 0, 0.12)"),
+        xaxis=dict(
+            title="Date",
+            showgrid=True,
+            gridcolor="rgba(148, 163, 184, 0.16)",
+            hoverformat="%Y-%m-%d",
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title=left_title,
+            showgrid=True,
+            gridcolor="rgba(148, 163, 184, 0.16)",
+            zeroline=False,
+        ),
     )
     if right_title:
-        layout["yaxis2"] = dict(title=right_title, overlaying="y", side="right", showgrid=False)
+        layout["yaxis2"] = dict(
+            title=right_title,
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            zeroline=False,
+        )
     fig.update_layout(**layout)
     if extra_axis:
         fig.update_layout(yaxis3=extra_axis)
@@ -45,8 +65,8 @@ def build_ps_chart(
             y=ps_plot.values,
             name="Trailing P/S",
             mode="lines",
-            line=dict(color="#1f77b4", width=2),
-            hovertemplate="Date=%{x|%Y-%m-%d}<br>Trailing P/S=%{y:.2f}<extra></extra>",
+            line=dict(color="#7dd3fc", width=2),
+            hovertemplate="Trailing P/S=%{y:.2f}<extra></extra>",
         ),
         secondary_y=False,
     )
@@ -56,8 +76,8 @@ def build_ps_chart(
             y=price_plot.values,
             name="Price",
             mode="lines",
-            line=dict(color="#2ca02c", width=2),
-            hovertemplate="Date=%{x|%Y-%m-%d}<br>Price=$%{y:.2f}<extra></extra>",
+            line=dict(color="#fbbf24", width=2),
+            hovertemplate="Price=$%{y:.2f}<extra></extra>",
         ),
         secondary_y=True,
     )
@@ -67,8 +87,9 @@ def build_ps_chart(
             y=revenue_plot.values,
             name="Quarterly Revenue",
             yaxis="y3",
-            marker=dict(color="rgba(255, 127, 14, 0.35)"),
-            hovertemplate="Quarter End=%{x|%Y-%m-%d}<br>Revenue=%{y:,.0f}<extra></extra>",
+            marker=dict(color="rgba(167, 139, 250, 0.55)"),
+            width=10 * 24 * 60 * 60 * 1000,
+            hovertemplate="Revenue=%{y:,.0f}<extra></extra>",
         )
     )
     return _apply_plotly_layout(
@@ -83,6 +104,7 @@ def build_ps_chart(
             anchor="free",
             position=0.97,
             showgrid=False,
+            zeroline=False,
         ),
     )
 
@@ -100,8 +122,8 @@ def build_pe_chart(
             y=pe_plot.values,
             name="Trailing P/E",
             mode="lines",
-            line=dict(color="#1f77b4", width=2),
-            hovertemplate="Date=%{x|%Y-%m-%d}<br>Trailing P/E=%{y:.2f}<extra></extra>",
+            line=dict(color="#7dd3fc", width=2),
+            hovertemplate="Trailing P/E=%{y:.2f}<extra></extra>",
         ),
         secondary_y=False,
     )
@@ -111,8 +133,8 @@ def build_pe_chart(
             y=price_plot.values,
             name="Price",
             mode="lines",
-            line=dict(color="#2ca02c", width=2),
-            hovertemplate="Date=%{x|%Y-%m-%d}<br>Price=$%{y:.2f}<extra></extra>",
+            line=dict(color="#fbbf24", width=2),
+            hovertemplate="Price=$%{y:.2f}<extra></extra>",
         ),
         secondary_y=True,
     )
@@ -122,8 +144,9 @@ def build_pe_chart(
             y=eps_plot.values,
             name="Quarterly EPS",
             yaxis="y3",
-            marker=dict(color="rgba(255, 127, 14, 0.35)"),
-            hovertemplate="Quarter End=%{x|%Y-%m-%d}<br>EPS=%{y:.2f}<extra></extra>",
+            marker=dict(color="rgba(52, 211, 153, 0.55)"),
+            width=10 * 24 * 60 * 60 * 1000,
+            hovertemplate="EPS=%{y:.2f}<extra></extra>",
         )
     )
     return _apply_plotly_layout(
@@ -138,6 +161,7 @@ def build_pe_chart(
             anchor="free",
             position=0.97,
             showgrid=False,
+            zeroline=False,
         ),
     )
 
@@ -155,8 +179,8 @@ def build_dividend_chart(
             y=price_history["Close"],
             name="Close",
             mode="lines",
-            line=dict(color="royalblue", width=2),
-            hovertemplate="Date=%{x|%Y-%m-%d}<br>Close=$%{y:.2f}<extra></extra>",
+            line=dict(color="#7dd3fc", width=2),
+            hovertemplate="Close=$%{y:.2f}<extra></extra>",
         ),
         secondary_y=False,
     )
@@ -166,8 +190,8 @@ def build_dividend_chart(
             y=price_history["Adj Close Rebased"],
             name="Adj Close (rebased)",
             mode="lines",
-            line=dict(color="orange", width=2),
-            hovertemplate="Date=%{x|%Y-%m-%d}<br>Adj Close=$%{y:.2f}<extra></extra>",
+            line=dict(color="#fbbf24", width=2),
+            hovertemplate="Adj Close=$%{y:.2f}<extra></extra>",
         ),
         secondary_y=False,
     )
@@ -176,13 +200,14 @@ def build_dividend_chart(
             x=dividends_to_plot.index,
             y=dividends_to_plot["Dividends"],
             name="Dividends",
-            marker=dict(color="rgba(44, 160, 44, 0.4)"),
+            marker=dict(color="rgba(52, 211, 153, 0.55)"),
             text=bar_labels if bar_labels else None,
             textposition="outside",
             textfont=dict(size=12),
             constraintext="none",
             cliponaxis=False,
-            hovertemplate="Date=%{x|%Y-%m-%d}<br>Dividend=$%{y:.4f}<extra></extra>",
+            width=10 * 24 * 60 * 60 * 1000,
+            hovertemplate="Dividend=$%{y:.4f}<extra></extra>",
         ),
         secondary_y=True,
     )

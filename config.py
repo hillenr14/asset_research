@@ -7,17 +7,22 @@ from models import AnalysisSettings, AppConfig
 
 
 CONFIG_FILE = "config.json"
+ROLLING_LOOKBACK_DAYS = 365 * 2
+
+
+def rolling_analysis_start_date() -> date:
+    return date.today() - timedelta(days=ROLLING_LOOKBACK_DAYS)
 
 
 def default_config() -> AppConfig:
     return AppConfig(
         dividend_analysis=AnalysisSettings(
             tickers=["VOO", "BKLN", "JEPI"],
-            start_date=date.today() - timedelta(days=365),
+            start_date=rolling_analysis_start_date(),
         ),
         valuation_analysis=AnalysisSettings(
             tickers=["MSFT", "AAPL"],
-            start_date=date.today() - timedelta(days=365 * 5),
+            start_date=rolling_analysis_start_date(),
         ),
     )
 
@@ -48,34 +53,30 @@ def load_config(path: str = CONFIG_FILE) -> AppConfig:
 
     dividend_raw = raw.get("dividend_analysis", {})
     valuation_raw = raw.get("pe_analysis", raw.get("valuation_analysis", {}))
+    rolling_start_date = rolling_analysis_start_date()
 
     return AppConfig(
         dividend_analysis=AnalysisSettings(
             tickers=_parse_tickers(dividend_raw.get("tickers"), defaults.dividend_analysis.tickers),
-            start_date=_parse_date(
-                dividend_raw.get("start_date"),
-                defaults.dividend_analysis.start_date,
-            ),
+            start_date=rolling_start_date,
         ),
         valuation_analysis=AnalysisSettings(
             tickers=_parse_tickers(valuation_raw.get("tickers"), defaults.valuation_analysis.tickers),
-            start_date=_parse_date(
-                valuation_raw.get("start_date"),
-                defaults.valuation_analysis.start_date,
-            ),
+            start_date=rolling_start_date,
         ),
     )
 
 
 def save_config(config: AppConfig, path: str = CONFIG_FILE) -> None:
+    rolling_start_date = rolling_analysis_start_date()
     payload = {
         "dividend_analysis": {
             "tickers": config.dividend_analysis.tickers,
-            "start_date": config.dividend_analysis.start_date.strftime("%Y-%m-%d"),
+            "start_date": rolling_start_date.strftime("%Y-%m-%d"),
         },
         "pe_analysis": {
             "tickers": config.valuation_analysis.tickers,
-            "start_date": config.valuation_analysis.start_date.strftime("%Y-%m-%d"),
+            "start_date": rolling_start_date.strftime("%Y-%m-%d"),
         },
     }
     with open(path, "w", encoding="utf-8") as file:

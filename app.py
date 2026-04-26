@@ -1,45 +1,255 @@
 from __future__ import annotations
 
-from datetime import date
+from typing import Callable
 
 import streamlit as st
 
-from config import load_config, save_config
+from config import load_config, rolling_analysis_start_date, save_config
+from data_provider import get_ticker_snapshot
 from metrics import analyze_dividend_ticker, analyze_valuation_ticker, fundamentals_to_frame
-from models import AnalysisSettings, DividendAnalysisResult, ValuationAnalysisResult
+from models import AnalysisSettings, AppConfig, DividendAnalysisResult, ValuationAnalysisResult
 from ui_helpers import (
     dataframe_to_csv_bytes,
-    dividend_status_frame,
     figure_to_html,
     format_dataframe_for_display,
-    parse_tickers,
-    validate_analysis_request,
-    valuation_status_frame,
+    normalize_single_ticker,
+    validate_single_ticker,
 )
 
 
-st.set_page_config(page_title="Stock Analysis App", layout="wide")
-st.title("Stock Analysis")
+st.set_page_config(
+    page_title="Stock Analysis App",
+    page_icon=":chart_with_upwards_trend:",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+def inject_page_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"],
+        [data-testid="stSidebarNav"],
+        [data-testid="collapsedControl"] {
+            display: none !important;
+        }
+
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+
+        .app-kicker {
+            color: #94a3b8;
+            font-size: 0.95rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .app-subtitle {
+            color: #cbd5e1;
+            max-width: 52rem;
+            margin-bottom: 1.5rem;
+        }
+
+        div[data-testid="stTabs"] button {
+            font-weight: 500;
+        }
+
+        div[data-testid="stButton"] > button {
+            border-radius: 0.85rem;
+        }
+
+        div[data-testid="stButton"] > button[kind="secondary"] {
+            background: #18263a;
+        }
+
+        div[data-testid="stTextInput"] input {
+            border-radius: 0.85rem;
+        }
+
+        .pane-title {
+            font-size: 0.95rem;
+            color: #cbd5e1;
+            margin-bottom: 0.5rem;
+            letter-spacing: 0.02em;
+        }
+
+        .pane-copy {
+            color: #94a3b8;
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+        }
+
+        .asset-name {
+            color: #94a3b8;
+            font-size: 0.82rem;
+            line-height: 1.2;
+            padding-top: 0.35rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_page_header() -> None:
+    st.markdown("##### :material/query_stats: Stock research dashboard")
+    st.markdown(
+        '<div class="app-subtitle">Analyze dividend and valuation signals for individual assets with a two-year rolling history window and persistent local price caching.</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def initialize_state() -> None:
     config = load_config()
-    st.session_state.setdefault("dividend_results", [])
-    st.session_state.setdefault("valuation_results", [])
-    st.session_state.setdefault(
-        "valuation_tickers",
-        config.valuation_analysis.tickers,
-    )
+    if "app_config" not in st.session_state:
+        st.session_state.app_config = config
+    else:
+        st.session_state.app_config.dividend_analysis.start_date = analysis_start_date()
+        st.session_state.app_config.valuation_analysis.start_date = analysis_start_date()
+    st.session_state.setdefault("dividend_results", {})
+    st.session_state.setdefault("valuation_results", {})
+    active_config = st.session_state.app_config
+    st.session_state.setdefault("dividend_selected_ticker", active_config.dividend_analysis.tickers[0] if active_config.dividend_analysis.tickers else None)
+    st.session_state.setdefault("valuation_selected_ticker", active_config.valuation_analysis.tickers[0] if active_config.valuation_analysis.tickers else None)
+    st.session_state.setdefault("dividend_add_ticker", "")
+    st.session_state.setdefault("valuation_add_ticker", "")
+    st.session_state["show_export_actions"] = False
+    st.session_state.setdefault("dividend_auto_signature", None)
+    st.session_state.setdefault("valuation_auto_signature", None)
 
 
-def render_export_controls(
-    label_prefix: str,
-    csv_name: str | None = None,
-    csv_data: bytes | None = None,
-    html_name: str | None = None,
-    html_data: str | None = None,
-) -> None:
-    if not st.session_state.get("show_export_actions"):
+def current_config() -> AppConfig:
+    return st.session_state.app_config
+
+
+def persist_current_config() -> None:
+    save_config(st.session_state.app_config)
+
+
+def analysis_start_date():
+    return rolling_analysis_start_date()
+
+
+def get_asset_label(ticker: str) -> str:
+    try:
+        snapshot, _ = get_ticker_snapshot(ticker)
+        if snapshot.short_name and snapshot.short_name != ticker:
+            return f"{ticker} · {snapshot.short_name}"
+    except Exception:
+        pass
+    return ticker
+
+
+def get_asset_name(ticker: str) -> str:
+    try:
+        snapshot, _ = get_ticker_snapshot(ticker)
+        if snapshot.short_name and snapshot.short_name != ticker:
+            return snapshot.short_name
+    except Exception:
+        pass
+    return ""
+
+
+def prune_results_for_mode(mode: str, tickers: list[str]) -> None:
+    key = f"{mode}_results"
+    current_results = st.session_state[key]
+    st.session_state[key] = {ticker: result for ticker, result in current_results.items() if ticker in tickers}
+
+
+def ensure_ticker_selection(mode: str) -> None:
+    tickers = getattr(current_config(), f"{mode}_analysis").tickers
+    selected_key = f"{mode}_selected_ticker"
+    selected = st.session_state.get(selected_key)
+    if selected in tickers:
+        return
+    st.session_state[selected_key] = tickers[0] if tickers else None
+
+
+def add_ticker(mode: str) -> None:
+    input_key = f"{mode}_add_ticker"
+    ticker = normalize_single_ticker(st.session_state.get(input_key, ""))
+    errors = validate_single_ticker(ticker)
+    if errors:
+        for message in errors:
+            st.warning(message)
+        return
+
+    config = current_config()
+    settings = getattr(config, f"{mode}_analysis")
+    if ticker in settings.tickers:
+        st.info(f"{ticker} is already in the list.")
+        return
+
+    settings.tickers.append(ticker)
+    settings.start_date = analysis_start_date()
+    persist_current_config()
+    st.session_state[input_key] = ""
+    st.session_state[f"{mode}_selected_ticker"] = ticker
+    analyze_single_ticker(mode, ticker)
+
+
+def remove_ticker(mode: str, ticker: str) -> None:
+    config = current_config()
+    settings = getattr(config, f"{mode}_analysis")
+    settings.tickers = [value for value in settings.tickers if value != ticker]
+    settings.start_date = analysis_start_date()
+    persist_current_config()
+
+    result_key = f"{mode}_results"
+    st.session_state[result_key].pop(ticker, None)
+    ensure_ticker_selection(mode)
+
+
+def analyze_single_ticker(mode: str, ticker: str) -> None:
+    if not ticker:
+        return
+
+    start_date = analysis_start_date()
+    analyzer: Callable[[str, object], object]
+    result_key: str
+    label: str
+    if mode == "dividend":
+        analyzer = analyze_dividend_ticker
+        result_key = "dividend_results"
+        label = "dividend"
+    else:
+        analyzer = analyze_valuation_ticker
+        result_key = "valuation_results"
+        label = "valuation"
+
+    with st.spinner(f"Analyzing {label} data for {ticker}..."):
+        st.session_state[result_key][ticker] = analyzer(ticker, start_date)
+
+
+def analyze_all_tickers(mode: str) -> None:
+    config = current_config()
+    tickers = getattr(config, f"{mode}_analysis").tickers
+    if not tickers:
+        st.warning("Add at least one ticker first.")
+        return
+
+    progress = st.progress(0.0, text=f"Preparing {mode} analysis...")
+    for index, ticker in enumerate(tickers, start=1):
+        progress.progress(index / len(tickers), text=f"Analyzing {ticker} ({index}/{len(tickers)})")
+        analyze_single_ticker(mode, ticker)
+    progress.empty()
+
+
+def sync_initial_analyses(mode: str) -> None:
+    tickers = getattr(current_config(), f"{mode}_analysis").tickers
+    signature = tuple(tickers)
+    signature_key = f"{mode}_auto_signature"
+    if st.session_state.get(signature_key) == signature:
+        return
+    if tickers:
+        analyze_all_tickers(mode)
+    st.session_state[signature_key] = signature
+
+
+def render_export_controls(label_prefix: str, csv_name: str | None = None, csv_data: bytes | None = None, html_name: str | None = None, html_data: str | None = None) -> None:
+    if not st.session_state.get("show_export_actions", False):
         return
 
     columns = st.columns(2)
@@ -63,172 +273,125 @@ def render_export_controls(
             )
 
 
-def run_dividend_analysis(tickers: list[str], start_date: date) -> list[DividendAnalysisResult]:
-    results: list[DividendAnalysisResult] = []
-    progress = st.progress(0.0, text="Preparing dividend analysis...")
-    for index, ticker in enumerate(tickers, start=1):
-        progress.progress(index / len(tickers), text=f"Analyzing dividends for {ticker} ({index}/{len(tickers)})")
-        results.append(analyze_dividend_ticker(ticker, start_date))
-    progress.empty()
-    return results
+def render_asset_list(mode: str) -> None:
+    config = current_config()
+    settings = getattr(config, f"{mode}_analysis")
+    settings.start_date = analysis_start_date()
+
+    pane_title = "Dividend Assets" if mode == "dividend" else "Valuation Assets"
+    st.markdown(f'<div class="pane-title">{pane_title}</div>', unsafe_allow_html=True)
+    st.caption(f"Historical window: {settings.start_date.isoformat()} to today")
+
+    add_cols = st.columns([1.1, 4.4])
+    with add_cols[0]:
+        if st.button("➕", key=f"{mode}-add-button", width="stretch"):
+            add_ticker(mode)
+            st.rerun()
+    with add_cols[1]:
+        st.text_input(
+            "Add ticker",
+            key=f"{mode}_add_ticker",
+            label_visibility="collapsed",
+            placeholder="Enter ticker",
+        )
+
+    st.divider()
+
+    for ticker in settings.tickers:
+        row = st.columns([0.8, 1.8, 3.4])
+        with row[0]:
+            if st.button("✖️", key=f"{mode}-remove-{ticker}", width="stretch"):
+                remove_ticker(mode, ticker)
+                st.rerun()
+        with row[1]:
+            if st.button(
+                ticker,
+                key=f"{mode}-select-{ticker}",
+                width="stretch",
+                type="primary" if st.session_state.get(f"{mode}_selected_ticker") == ticker else "secondary",
+            ):
+                st.session_state[f"{mode}_selected_ticker"] = ticker
+                analyze_single_ticker(mode, ticker)
+                st.rerun()
+        with row[2]:
+            asset_name = get_asset_name(ticker)
+            if asset_name:
+                st.markdown(f'<div class="asset-name">{asset_name}</div>', unsafe_allow_html=True)
 
 
-def run_valuation_analysis(tickers: list[str], start_date: date) -> list[ValuationAnalysisResult]:
-    results: list[ValuationAnalysisResult] = []
-    progress = st.progress(0.0, text="Preparing valuation analysis...")
-    for index, ticker in enumerate(tickers, start=1):
-        progress.progress(index / len(tickers), text=f"Analyzing valuation for {ticker} ({index}/{len(tickers)})")
-        results.append(analyze_valuation_ticker(ticker, start_date))
-    progress.empty()
-    return results
-
-
-def render_sidebar() -> None:
-    config = load_config()
-
-    st.sidebar.header("Controls")
-    st.sidebar.checkbox("Show export actions", key="show_export_actions")
-
-    with st.sidebar.expander("Dividend & Price Analysis", expanded=True):
-        with st.form("dividend-analysis-form"):
-            div_tickers_input = st.text_area(
-                "Tickers:",
-                value="\n".join(config.dividend_analysis.tickers),
-                height=120,
-            )
-            div_start_date = st.date_input(
-                "Start Date:",
-                value=config.dividend_analysis.start_date,
-            )
-            submitted = st.form_submit_button("Analyze Dividends & Price")
-
-        if submitted:
-            tickers, duplicates = parse_tickers(div_tickers_input)
-            validation_errors = validate_analysis_request(tickers, div_start_date)
-            if duplicates:
-                st.warning(f"Duplicate tickers removed: {', '.join(duplicates)}")
-            if validation_errors:
-                for message in validation_errors:
-                    st.error(message)
-            else:
-                config.dividend_analysis = AnalysisSettings(tickers=tickers, start_date=div_start_date)
-                save_config(config)
-                with st.spinner("Running dividend analysis..."):
-                    st.session_state.dividend_results = run_dividend_analysis(tickers, div_start_date)
-
-    with st.sidebar.expander("Historical Valuation Analysis", expanded=True):
-        with st.form("valuation-analysis-form"):
-            valuation_tickers_input = st.text_area(
-                "Tickers:",
-                value="\n".join(config.valuation_analysis.tickers),
-                height=120,
-            )
-            valuation_start_date = st.date_input(
-                "Start Date:",
-                value=config.valuation_analysis.start_date,
-                key="valuation-start-date",
-            )
-            submitted = st.form_submit_button("Analyze Valuation Ratios")
-
-        if submitted:
-            tickers, duplicates = parse_tickers(valuation_tickers_input)
-            validation_errors = validate_analysis_request(tickers, valuation_start_date)
-            if duplicates:
-                st.warning(f"Duplicate tickers removed: {', '.join(duplicates)}")
-            if validation_errors:
-                for message in validation_errors:
-                    st.error(message)
-            else:
-                config.valuation_analysis = AnalysisSettings(tickers=tickers, start_date=valuation_start_date)
-                save_config(config)
-                st.session_state.valuation_tickers = tickers
-                with st.spinner("Running valuation analysis..."):
-                    st.session_state.valuation_results = run_valuation_analysis(tickers, valuation_start_date)
-
-    st.sidebar.info("Inputs are saved in `config.json`.", icon="💡")
-
-
-def render_dividend_summary(results: list[DividendAnalysisResult]) -> None:
-    if not results:
-        st.info("Click 'Analyze Dividends & Price' to see results.")
+def render_dividend_main(result: DividendAnalysisResult | None, ticker: str | None) -> None:
+    if not ticker:
+        st.info("Add a ticker on the left to view dividend analysis.")
         return
 
-    st.header("Dividend Analysis Status")
-    st.dataframe(dividend_status_frame(results), hide_index=True, width="stretch")
-
-    successful_results = [result for result in results if result.is_success and result.fundamentals is not None]
-    if successful_results:
-        st.header("Combined Fundamentals & Metrics")
-        combined_df = fundamentals_to_frame([result.fundamentals for result in successful_results if result.fundamentals])
-        display_df = format_dataframe_for_display(combined_df)
-        st.dataframe(display_df, width="stretch")
-        render_export_controls(
-            label_prefix="combined-dividend-summary",
-            csv_name="dividend_summary.csv",
-            csv_data=dataframe_to_csv_bytes(combined_df),
-        )
-
-    st.header("Individual Charts")
-    for result in results:
-        st.subheader(f"Analysis for {result.ticker}")
-        if result.issue:
-            st.error(result.issue.message)
-            if result.issue.details:
-                st.caption(result.issue.details)
-            continue
-
-        if not result.fundamentals or result.figure is None:
-            st.warning("No dividend output was generated for this ticker.")
-            continue
-
-        detail_df = format_dataframe_for_display(fundamentals_to_frame([result.fundamentals]))
-        col1, col2 = st.columns([0.7, 1.8])
-        with col1:
-            st.dataframe(detail_df, width="stretch")
-        with col2:
-            st.plotly_chart(result.figure, width="stretch")
-
-        render_export_controls(
-            label_prefix=f"{result.ticker}-dividend",
-            csv_name=f"{result.ticker.lower()}_dividend_fundamentals.csv",
-            csv_data=dataframe_to_csv_bytes(fundamentals_to_frame([result.fundamentals])),
-            html_name=f"{result.ticker.lower()}_dividend_chart.html",
-            html_data=figure_to_html(result.figure),
-        )
-
-
-def render_valuation_tab(result: ValuationAnalysisResult | None) -> None:
     if result is None:
-        st.info("Click 'Analyze Valuation Ratios' to see results.")
+        st.info("Click an asset on the left to analyze and display it.")
         return
 
+    st.header(f"Dividend Analysis: {ticker}")
     if result.issue:
         st.error(result.issue.message)
         if result.issue.details:
             st.caption(result.issue.details)
         return
 
-    col1, col2 = st.columns([0.7, 1.8])
-    with col1:
-        st.subheader("Fundamentals")
-        if result.fundamentals is not None:
-            fundamentals_df = format_dataframe_for_display(fundamentals_to_frame([result.fundamentals]))
-            st.dataframe(fundamentals_df, width="stretch")
-            render_export_controls(
-                label_prefix=f"{result.ticker}-valuation-fundamentals",
-                csv_name=f"{result.ticker.lower()}_valuation_fundamentals.csv",
-                csv_data=dataframe_to_csv_bytes(fundamentals_to_frame([result.fundamentals])),
-            )
-        else:
-            st.warning("Could not retrieve fundamentals.")
+    if not result.fundamentals or result.figure is None:
+        st.warning("No dividend output was generated for this ticker.")
+        return
 
-    with col2:
+    st.markdown('<div class="pane-copy">Selected asset output appears here after you click a ticker in the left pane.</div>', unsafe_allow_html=True)
+    detail_df = fundamentals_to_frame([result.fundamentals])
+    left, right = st.columns([1.05, 2.65], vertical_alignment="top")
+    with left:
+        st.dataframe(format_dataframe_for_display(detail_df), width="stretch")
+        render_export_controls(
+            label_prefix=f"{ticker}-dividend",
+            csv_name=f"{ticker.lower()}_dividend_fundamentals.csv",
+            csv_data=dataframe_to_csv_bytes(detail_df),
+        )
+    with right:
+        st.plotly_chart(result.figure, width="stretch")
+        render_export_controls(
+            label_prefix=f"{ticker}-dividend-chart",
+            html_name=f"{ticker.lower()}_dividend_chart.html",
+            html_data=figure_to_html(result.figure),
+        )
+
+
+def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | None) -> None:
+    if not ticker:
+        st.info("Add a ticker on the left to view valuation analysis.")
+        return
+
+    if result is None:
+        st.info("Click an asset on the left to analyze and display it.")
+        return
+
+    st.header(f"Valuation Analysis: {ticker}")
+    if result.issue:
+        st.error(result.issue.message)
+        if result.issue.details:
+            st.caption(result.issue.details)
+        return
+
+    st.markdown('<div class="pane-copy">Selected asset output appears here after you click a ticker in the left pane.</div>', unsafe_allow_html=True)
+    left, right = st.columns([1.05, 2.65], vertical_alignment="top")
+    with left:
+        if result.fundamentals is not None:
+            fundamentals_df = fundamentals_to_frame([result.fundamentals])
+            st.dataframe(format_dataframe_for_display(fundamentals_df), width="stretch")
+            render_export_controls(
+                label_prefix=f"{ticker}-valuation-fundamentals",
+                csv_name=f"{ticker.lower()}_valuation_fundamentals.csv",
+                csv_data=dataframe_to_csv_bytes(fundamentals_df),
+            )
+    with right:
         st.subheader("Price-to-Earnings (P/E) Ratio")
         if result.pe_figure is not None:
             st.plotly_chart(result.pe_figure, width="stretch")
             render_export_controls(
-                label_prefix=f"{result.ticker}-pe",
-                html_name=f"{result.ticker.lower()}_pe_chart.html",
+                label_prefix=f"{ticker}-pe",
+                html_name=f"{ticker.lower()}_pe_chart.html",
                 html_data=figure_to_html(result.pe_figure),
             )
         elif result.pe_issue is not None:
@@ -238,40 +401,48 @@ def render_valuation_tab(result: ValuationAnalysisResult | None) -> None:
         if result.ps_figure is not None:
             st.plotly_chart(result.ps_figure, width="stretch")
             render_export_controls(
-                label_prefix=f"{result.ticker}-ps",
-                html_name=f"{result.ticker.lower()}_ps_chart.html",
+                label_prefix=f"{ticker}-ps",
+                html_name=f"{ticker.lower()}_ps_chart.html",
                 html_data=figure_to_html(result.ps_figure),
             )
         elif result.ps_issue is not None:
             st.warning(result.ps_issue.message)
 
 
-def render_main_area() -> None:
-    dividend_results: list[DividendAnalysisResult] = st.session_state.dividend_results
-    valuation_results: list[ValuationAnalysisResult] = st.session_state.valuation_results
-    valuation_by_ticker = {result.ticker: result for result in valuation_results}
-    valuation_tickers = st.session_state.valuation_tickers
+def render_analysis_tab(mode: str) -> None:
+    ensure_ticker_selection(mode)
+    settings = getattr(current_config(), f"{mode}_analysis")
+    prune_results_for_mode(mode, settings.tickers)
+    sync_initial_analyses(mode)
 
-    tab_names = ["Summary & Dividends"] + [f"{ticker} Valuation" for ticker in valuation_tickers]
-    tabs = st.tabs(tab_names)
+    left, right = st.columns([0.9, 3.4], vertical_alignment="top")
+    with left:
+        asset_pane = st.container(border=True)
+        with asset_pane:
+            render_asset_list(mode)
+    with right:
+        detail_pane = st.container(border=True)
+        selected_ticker = st.session_state.get(f"{mode}_selected_ticker")
+        result = st.session_state[f"{mode}_results"].get(selected_ticker) if selected_ticker else None
+        with detail_pane:
+            if mode == "dividend":
+                render_dividend_main(result, selected_ticker)
+            else:
+                render_valuation_main(result, selected_ticker)
 
-    with tabs[0]:
-        render_dividend_summary(dividend_results)
-        if valuation_results:
-            st.header("Valuation Analysis Status")
-            st.dataframe(valuation_status_frame(valuation_results), hide_index=True, width="stretch")
-            render_export_controls(
-                label_prefix="valuation-status",
-                csv_name="valuation_status.csv",
-                csv_data=dataframe_to_csv_bytes(valuation_status_frame(valuation_results)),
-            )
 
-    for index, ticker in enumerate(valuation_tickers, start=1):
-        with tabs[index]:
-            st.header(f"Valuation Analysis for {ticker}")
-            render_valuation_tab(valuation_by_ticker.get(ticker))
+def render_page() -> None:
+    inject_page_styles()
+    render_page_header()
+    st.caption("Ticker lists are saved in `config.json`. Historical price data is cached in `.cache/`.")
+
+    dividend_tab, valuation_tab = st.tabs(["Dividend Analysis", "Valuation Analysis"])
+
+    with dividend_tab:
+        render_analysis_tab("dividend")
+    with valuation_tab:
+        render_analysis_tab("valuation")
 
 
 initialize_state()
-render_sidebar()
-render_main_area()
+render_page()

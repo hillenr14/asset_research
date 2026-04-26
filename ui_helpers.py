@@ -8,6 +8,10 @@ import plotly.graph_objects as go
 from models import DividendAnalysisResult, ValuationAnalysisResult
 
 
+def normalize_single_ticker(text: str) -> str:
+    return text.strip().upper()
+
+
 def parse_tickers(text: str) -> tuple[list[str], list[str]]:
     tickers: list[str] = []
     duplicates: list[str] = []
@@ -32,6 +36,15 @@ def validate_analysis_request(tickers: list[str], start_date: date) -> list[str]
         errors.append("Enter at least one ticker.")
     if start_date > date.today():
         errors.append("Start date cannot be in the future.")
+    return errors
+
+
+def validate_single_ticker(ticker: str) -> list[str]:
+    errors: list[str] = []
+    if not ticker:
+        errors.append("Enter a ticker before adding it to the list.")
+    elif " " in ticker:
+        errors.append("Enter one ticker at a time.")
     return errors
 
 

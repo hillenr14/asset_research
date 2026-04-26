@@ -12,3 +12,6 @@ venv/
 # User-specific config
 config.json
 tickers.txt
+
+# Local data cache
+.cache/
