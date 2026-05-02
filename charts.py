@@ -219,3 +219,70 @@ def build_dividend_chart(
     )
     fig.update_yaxes(rangemode="tozero", secondary_y=True)
     return fig
+
+
+def build_holdings_portfolio_chart(
+    portfolio_value_history: pd.DataFrame,
+    monthly_income_history: pd.DataFrame,
+    title: str = "Holdings Portfolio - Total Value and Monthly Income",
+) -> go.Figure:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Scatter(
+            x=portfolio_value_history.index,
+            y=portfolio_value_history["Portfolio Value"],
+            name="Portfolio Value",
+            mode="lines",
+            line=dict(color="#7dd3fc", width=2),
+            hovertemplate="Portfolio Value=$%{y:,.2f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    if "Reinvested Portfolio Value" in portfolio_value_history.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=portfolio_value_history.index,
+                y=portfolio_value_history["Reinvested Portfolio Value"],
+                name="Value With Reinvestment",
+                mode="lines",
+                line=dict(color="#f472b6", width=2),
+                hovertemplate="Reinvested Value=$%{y:,.2f}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+
+    income_labels = [
+        f"${value:,.2f}" if value > 0 else ""
+        for value in monthly_income_history["Income"].fillna(0.0)
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=monthly_income_history.index,
+            y=monthly_income_history["Income"],
+            name="Monthly Income",
+            marker=dict(color="rgba(52, 211, 153, 0.55)"),
+            text=income_labels,
+            textposition="outside",
+            textfont=dict(size=12),
+            constraintext="none",
+            cliponaxis=False,
+            width=10 * 24 * 60 * 60 * 1000,
+            hovertemplate="Monthly Income=$%{y:,.2f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    fig = _apply_plotly_layout(
+        fig,
+        title,
+        "Portfolio Value ($)",
+        "Monthly Income ($)",
+    )
+    fig.update_yaxes(tickprefix="$", separatethousands=True, secondary_y=False)
+    fig.update_yaxes(
+        tickprefix="$",
+        separatethousands=True,
+        rangemode="tozero",
+        secondary_y=True,
+    )
+    return fig

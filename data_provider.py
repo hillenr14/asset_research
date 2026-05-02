@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -15,6 +18,11 @@ from models import TickerSnapshot
 CACHE_DIR = Path(".cache/price_history")
 CACHE_EXTENSION = ".csv"
 CACHE_TTL_SECONDS = 86400
+SNAPSHOT_CACHE_DIR = Path(".cache/ticker_snapshots")
+SNAPSHOT_CACHE_EXTENSION = ".json"
+STATEMENT_CACHE_EXTENSION = ".statement.csv"
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+MARKET_CLOSE_HOUR = 16
 
 
 def _safe_float(value: Any) -> float | None:
@@ -73,6 +81,15 @@ def _cache_path_for(symbol: str) -> Path:
     return CACHE_DIR / f"{symbol.lower()}{CACHE_EXTENSION}"
 
 
+def _snapshot_cache_paths_for(symbol: str) -> tuple[Path, Path]:
+    SNAPSHOT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    base_name = symbol.lower()
+    return (
+        SNAPSHOT_CACHE_DIR / f"{base_name}{SNAPSHOT_CACHE_EXTENSION}",
+        SNAPSHOT_CACHE_DIR / f"{base_name}{STATEMENT_CACHE_EXTENSION}",
+    )
+
+
 def _read_cached_history(symbol: str) -> pd.DataFrame:
     path = _cache_path_for(symbol)
     if not path.exists():
@@ -86,11 +103,62 @@ def _read_cached_history(symbol: str) -> pd.DataFrame:
     return _normalize_history_frame(cached)
 
 
+def _latest_expected_history_date() -> date:
+    now_market = datetime.now(MARKET_TIMEZONE)
+    market_close_today = now_market.replace(
+        hour=MARKET_CLOSE_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    today = now_market.date()
+    if now_market >= market_close_today:
+        return today
+    return today - timedelta(days=1)
+
+
+def _cached_history_is_fresh(cached_end: date) -> bool:
+    return cached_end >= _latest_expected_history_date()
+
+
+def _snapshot_path_is_fresh(path: Path) -> bool:
+    if not path.exists():
+        return False
+    file_date = datetime.fromtimestamp(path.stat().st_mtime, tz=MARKET_TIMEZONE).date()
+    return file_date >= _latest_expected_history_date()
+
+
 def _write_cached_history(symbol: str, history: pd.DataFrame) -> None:
     path = _cache_path_for(symbol)
     history_to_save = history.copy()
     history_to_save.index = pd.to_datetime(history_to_save.index).tz_localize(None)
     history_to_save.to_csv(path)
+
+
+def _read_cached_snapshot(symbol: str) -> tuple[TickerSnapshot, pd.DataFrame] | None:
+    snapshot_path, statement_path = _snapshot_cache_paths_for(symbol)
+    if not (_snapshot_path_is_fresh(snapshot_path) and _snapshot_path_is_fresh(statement_path)):
+        return None
+
+    try:
+        snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        snapshot = TickerSnapshot(**snapshot_payload)
+        if statement_path.stat().st_size <= 1:
+            statement = pd.DataFrame()
+        else:
+            statement = pd.read_csv(statement_path, index_col=0)
+            statement.columns = pd.to_datetime(statement.columns).tz_localize(None)
+            statement = _normalize_financial_statement(statement)
+    except Exception:
+        return None
+
+    return snapshot, statement
+
+
+def _write_cached_snapshot(symbol: str, snapshot: TickerSnapshot, quarterly_income_stmt: pd.DataFrame) -> None:
+    snapshot_path, statement_path = _snapshot_cache_paths_for(symbol)
+    snapshot_path.write_text(json.dumps(asdict(snapshot)), encoding="utf-8")
+    _normalize_financial_statement(quarterly_income_stmt).to_csv(statement_path)
 
 
 def _download_history_segment(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
@@ -123,16 +191,18 @@ def _refresh_cached_history(symbol: str, start_date: date, end_date: date) -> pd
 
     cached_start = cached.index.min().date()
     cached_end = cached.index.max().date()
+    cache_is_fresh = _cached_history_is_fresh(cached_end)
 
     if start_date < cached_start:
         segments.append(_download_history_segment(symbol, start_date, cached_start - timedelta(days=1)))
 
-    if cached_end < end_date:
+    if not cache_is_fresh and cached_end < end_date:
         update_start = max(start_date, cached_end - timedelta(days=7))
         segments.append(_download_history_segment(symbol, update_start, end_date))
 
-    if segments:
-        combined = pd.concat([cached] + [segment for segment in segments if not segment.empty], axis=0)
+    non_empty_segments = [segment for segment in segments if not segment.empty]
+    if non_empty_segments:
+        combined = pd.concat([cached] + non_empty_segments, axis=0)
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
         _write_cached_history(symbol, combined)
         cached = combined
@@ -190,9 +260,12 @@ def _build_snapshot(ticker: str, info: dict[str, Any], fast_info: dict[str, Any]
     )
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame]:
     symbol = ticker.strip().upper()
+    cached = _read_cached_snapshot(symbol)
+    if cached is not None:
+        return cached
+
     try:
         stock = yf.Ticker(symbol)
         info = stock.info or {}
@@ -217,10 +290,10 @@ def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame]:
     ):
         raise InvalidTickerError(f"Ticker '{symbol}' was not found or returned no usable data.")
 
+    _write_cached_snapshot(symbol, snapshot, quarterly_income_stmt)
     return snapshot, quarterly_income_stmt
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_price_history(ticker: str, start_date: date, end_date: date) -> pd.DataFrame:
     symbol = ticker.strip().upper()
     try:
@@ -232,7 +305,6 @@ def get_price_history(ticker: str, start_date: date, end_date: date) -> pd.DataF
         ) from exc
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_daily_close_history(ticker: str, start_date: date, end_date: date) -> pd.Series:
     symbol = ticker.strip().upper()
     try:

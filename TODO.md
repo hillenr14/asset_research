@@ -2,6 +2,8 @@
 
 ## Completed
 
+- Renamed Portfolio Analysis to Holdings Analysis and replaced the raw imported Numbers table with a filtered/enriched holdings analysis table.
+- Added a new Portfolio Analysis tab that imports the Holdings table from `Investments.numbers` and renders it in the right pane.
 - Removed the Analyze All button and now auto-analyze both modes on page load/refresh, with the first ticker selected by default.
 - When a ticker is added, that ticker is immediately selected and analyzed.
 - Updated the plus/minus controls to render as real buttons with emoji glyphs.

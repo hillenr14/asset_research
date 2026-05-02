@@ -4,8 +4,19 @@ from typing import Callable
 
 import streamlit as st
 
+from charts import build_holdings_portfolio_chart
 from config import load_config, rolling_analysis_start_date, save_config
 from data_provider import get_ticker_snapshot
+from portfolio_data import (
+    PORTFOLIO_DOCUMENT_PATH,
+    PORTFOLIO_SHEET_NAME,
+    PORTFOLIO_TABLE_NAME,
+    build_holdings_analysis_table,
+    build_holdings_portfolio_histories,
+    compute_holdings_totals,
+    format_portfolio_holdings_for_display,
+    refresh_holdings_analysis_data,
+)
 from metrics import analyze_dividend_ticker, analyze_valuation_ticker, fundamentals_to_frame
 from models import AnalysisSettings, AppConfig, DividendAnalysisResult, ValuationAnalysisResult
 from ui_helpers import (
@@ -87,6 +98,19 @@ def inject_page_styles() -> None:
             line-height: 1.2;
             padding-top: 0.35rem;
         }
+
+        .totals-row {
+            display: flex;
+            gap: 2rem;
+            margin-top: 0.9rem;
+            color: #cbd5e1;
+            font-size: 0.9rem;
+        }
+
+        .totals-row strong {
+            color: #f8fafc;
+            font-weight: 600;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -118,6 +142,7 @@ def initialize_state() -> None:
     st.session_state["show_export_actions"] = False
     st.session_state.setdefault("dividend_auto_signature", None)
     st.session_state.setdefault("valuation_auto_signature", None)
+    st.session_state.setdefault("holdings_refreshed_on_load", False)
 
 
 def current_config() -> AppConfig:
@@ -409,6 +434,72 @@ def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | 
             st.warning(result.ps_issue.message)
 
 
+def render_portfolio_tab() -> None:
+    if not st.session_state.get("holdings_refreshed_on_load", False):
+        refresh_holdings_analysis_data()
+        st.session_state["holdings_refreshed_on_load"] = True
+
+    left, right = st.columns([0.9, 3.4], vertical_alignment="top")
+    with left:
+        portfolio_pane = st.container(border=True)
+        with portfolio_pane:
+            st.markdown('<div class="pane-title">Portfolio Source</div>', unsafe_allow_html=True)
+            st.caption(f"Document: {PORTFOLIO_DOCUMENT_PATH.name}")
+            st.caption(f"Sheet: {PORTFOLIO_SHEET_NAME}")
+            st.caption(f"Table: {PORTFOLIO_TABLE_NAME}")
+    with right:
+        holdings_pane = st.container(border=True)
+        with holdings_pane:
+            st.header("Holdings Analysis")
+            st.markdown(
+                '<div class="pane-copy">Imported core holdings data from the Numbers workbook, enriched with live yfinance fields and calculated portfolio metrics.</div>',
+                unsafe_allow_html=True,
+            )
+            try:
+                holdings_df = build_holdings_analysis_table()
+                totals = compute_holdings_totals(holdings_df)
+                st.dataframe(
+                    format_portfolio_holdings_for_display(holdings_df),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.markdown(
+                    f'''
+                    <div class="totals-row">
+                        <span><strong>Total Market Value:</strong> ${totals["market_value"]:,.2f}</span>
+                        <span><strong>Total Income:</strong> ${totals["income"]:,.2f}</span>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True,
+                )
+                portfolio_histories = build_holdings_portfolio_histories()
+                portfolio_value_history, monthly_income_history = portfolio_histories["actual"]
+                if not portfolio_value_history.empty:
+                    st.divider()
+                    st.subheader("One-Year Portfolio Performance")
+                    st.plotly_chart(
+                        build_holdings_portfolio_chart(
+                            portfolio_value_history,
+                            monthly_income_history,
+                            title="Holdings Portfolio - Actual Held Period",
+                        ),
+                        width="stretch",
+                    )
+                full_year_value_history, full_year_income_history = portfolio_histories["full_year"]
+                if not full_year_value_history.empty:
+                    st.subheader("One-Year Portfolio Performance Assuming Current Holdings Were Held All Year")
+                    st.plotly_chart(
+                        build_holdings_portfolio_chart(
+                            full_year_value_history,
+                            full_year_income_history,
+                            title="Holdings Portfolio - Current Holdings Held for Full Year",
+                        ),
+                        width="stretch",
+                    )
+            except Exception as exc:
+                st.error(str(exc))
+
+
 def render_analysis_tab(mode: str) -> None:
     ensure_ticker_selection(mode)
     settings = getattr(current_config(), f"{mode}_analysis")
@@ -436,12 +527,16 @@ def render_page() -> None:
     render_page_header()
     st.caption("Ticker lists are saved in `config.json`. Historical price data is cached in `.cache/`.")
 
-    dividend_tab, valuation_tab = st.tabs(["Dividend Analysis", "Valuation Analysis"])
+    dividend_tab, valuation_tab, portfolio_tab = st.tabs(
+        ["Dividend Analysis", "Valuation Analysis", "Holdings Analysis"]
+    )
 
     with dividend_tab:
         render_analysis_tab("dividend")
     with valuation_tab:
         render_analysis_tab("valuation")
+    with portfolio_tab:
+        render_portfolio_tab()
 
 
 initialize_state()

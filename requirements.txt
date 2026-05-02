@@ -3,3 +3,5 @@ yfinance
 pandas
 numpy
 plotly
+numbers-parser
+protobuf==6.33.4
