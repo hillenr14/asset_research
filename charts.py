@@ -184,6 +184,110 @@ def build_pe_chart(
     )
 
 
+def build_valuation_chart(
+    snapshot: TickerSnapshot,
+    price_plot: pd.Series,
+    pe_plot: pd.Series,
+    eps_pct_plot: pd.Series | None = None,
+    revenue_pct_plot: pd.Series | None = None,
+    free_cash_flow_pct_plot: pd.Series | None = None,
+    show_quarterly_bars: bool = True,
+) -> go.Figure:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    bar_width_ms = _bar_width_ms(price_plot.index)
+    fig.add_trace(
+        go.Scatter(
+            x=pe_plot.index,
+            y=pe_plot.values,
+            name="Trailing P/E",
+            mode="lines",
+            line=dict(color="#7dd3fc", width=2),
+            hovertemplate="Trailing P/E=%{y:.2f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=price_plot.index,
+            y=price_plot.values,
+            name="Price",
+            mode="lines",
+            line=dict(color="#fbbf24", width=2),
+            hovertemplate="Price=$%{y:.2f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    if show_quarterly_bars and eps_pct_plot is not None and not eps_pct_plot.empty:
+        fig.add_trace(
+            go.Bar(
+                x=eps_pct_plot.index,
+                y=eps_pct_plot.values,
+                name="EPS / Price",
+                yaxis="y3",
+                marker=dict(color="rgba(52, 211, 153, 0.55)"),
+                text=[f"{value:.2f}%" for value in eps_pct_plot.values],
+                textposition="outside",
+                textfont=dict(size=11),
+                constraintext="none",
+                cliponaxis=False,
+                width=bar_width_ms,
+                hovertemplate="EPS / Price=%{y:.2f}%<extra></extra>",
+            )
+        )
+    if show_quarterly_bars and revenue_pct_plot is not None and not revenue_pct_plot.empty:
+        fig.add_trace(
+            go.Bar(
+                x=revenue_pct_plot.index,
+                y=revenue_pct_plot.values,
+                name="Rev/Share / Price",
+                yaxis="y3",
+                marker=dict(color="rgba(167, 139, 250, 0.55)"),
+                text=[f"{value:.2f}%" for value in revenue_pct_plot.values],
+                textposition="outside",
+                textfont=dict(size=11),
+                constraintext="none",
+                cliponaxis=False,
+                width=bar_width_ms,
+                hovertemplate="Revenue / Price=%{y:.2f}%<extra></extra>",
+            )
+        )
+    if show_quarterly_bars and free_cash_flow_pct_plot is not None and not free_cash_flow_pct_plot.empty:
+        fig.add_trace(
+            go.Bar(
+                x=free_cash_flow_pct_plot.index,
+                y=free_cash_flow_pct_plot.values,
+                name="FCF / Price",
+                yaxis="y3",
+                marker=dict(color="rgba(244, 114, 182, 0.60)"),
+                text=[f"{value:.2f}%" for value in free_cash_flow_pct_plot.values],
+                textposition="outside",
+                textfont=dict(size=11),
+                constraintext="none",
+                cliponaxis=False,
+                width=bar_width_ms,
+                hovertemplate="FCF / Price=%{y:.2f}%<extra></extra>",
+            )
+        )
+    fig = _apply_plotly_layout(
+        fig,
+        f"{snapshot.short_name} ({snapshot.ticker}) - Price, Trailing P/E, and Quarterly Metrics",
+        "P/E Ratio",
+        "Price",
+        extra_axis=dict(
+            title="Quarterly % of Price",
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=0.97,
+            showgrid=False,
+            zeroline=False,
+            ticksuffix="%",
+        ),
+    )
+    fig.update_layout(barmode="group", bargap=0.056, bargroupgap=0.014)
+    return fig
+
+
 def build_dividend_chart(
     snapshot: TickerSnapshot,
     price_history: pd.DataFrame,

@@ -86,12 +86,13 @@ def valuation_status_frame(results: list[ValuationAnalysisResult]) -> pd.DataFra
                 "Ticker": result.ticker,
                 "Overall": result.status.title(),
                 "P/E": "Ready" if result.pe_figure is not None else (result.pe_issue.category if result.pe_issue else ""),
-                "P/S": "Ready" if result.ps_figure is not None else (result.ps_issue.category if result.ps_issue else ""),
+                "Revenue": "Ready" if result.ps_issue is None else result.ps_issue.category,
+                "FCF": "Ready" if result.fcf_issue is None else result.fcf_issue.category,
                 "Message": (
                     result.issue.message
                     if result.issue
                     else "; ".join(
-                        issue.message for issue in [result.pe_issue, result.ps_issue] if issue is not None
+                        issue.message for issue in [result.pe_issue, result.ps_issue, result.fcf_issue] if issue is not None
                     )
                     or "Valuation analysis complete."
                 ),

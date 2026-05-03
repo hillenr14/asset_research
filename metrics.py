@@ -5,7 +5,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from charts import build_dividend_chart, build_pe_chart, build_ps_chart
+from charts import build_dividend_chart, build_valuation_chart
 from data_provider import get_daily_close_history, get_full_price_history, get_price_history, get_ticker_snapshot
 from errors import MissingDataError, UnsupportedAnalysisError, to_issue
 from models import DividendAnalysisResult, Fundamentals, TickerSnapshot, ValuationAnalysisResult
@@ -63,6 +63,14 @@ def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) 
     beta_vs_spy = None
     sharpe_ratio = None
     sharpe_ratio_adj = None
+    trailing_eps = None
+
+    if (
+        snapshot.regular_market_price not in (None, 0)
+        and snapshot.trailing_pe not in (None, 0)
+        and snapshot.trailing_pe is not None
+    ):
+        trailing_eps = snapshot.regular_market_price / snapshot.trailing_pe
 
     if history is not None and not history.empty:
         start_date = pd.Timestamp(history.index.min()).date()
@@ -94,6 +102,7 @@ def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) 
         price=snapshot.regular_market_price,
         dividend_yield=_normalize_dividend_yield(snapshot.dividend_yield),
         trailing_pe=snapshot.trailing_pe,
+        trailing_eps=trailing_eps,
         asset_type=snapshot.asset_type,
         start_date=start_date,
         end_date=end_date,
@@ -206,7 +215,7 @@ def _compute_dividend_labels(dividends_to_plot: pd.DataFrame, dividend_history: 
 
 def analyze_dividend_ticker(ticker: str, start_date: date) -> DividendAnalysisResult:
     try:
-        snapshot, _ = get_ticker_snapshot(ticker)
+        snapshot, _, _ = get_ticker_snapshot(ticker)
         history = get_price_history(ticker, start_date, date.today())
         if history.empty:
             raise MissingDataError(f"No price history is available for {ticker} in the selected date range.")
@@ -304,9 +313,64 @@ def _compute_ps_inputs(
     )
 
 
+def _quarterly_series_as_pct_of_price(
+    quarterly_series: pd.Series,
+    price_series: pd.Series,
+    plot_start_date: date,
+) -> pd.Series:
+    aligned_price = price_series.sort_index().reindex(quarterly_series.index.sort_values(), method="ffill")
+    annualized_quarterly_series = quarterly_series * 4
+    pct_series = ((annualized_quarterly_series / aligned_price) * 100).replace([np.inf, -np.inf], np.nan).dropna()
+    return pct_series.loc[plot_start_date:]
+
+
+def _compute_free_cash_flow_inputs(
+    cashflow_statement: pd.DataFrame,
+    snapshot: TickerSnapshot,
+    plot_start_date: date,
+) -> pd.Series:
+    if cashflow_statement.empty:
+        raise MissingDataError("Quarterly cash flow statement data is not available for free-cash-flow analysis.")
+
+    if "Free Cash Flow" in cashflow_statement.index:
+        free_cash_flow = cashflow_statement.loc["Free Cash Flow"].sort_index()
+    else:
+        operating_cash_flow = _get_first_matching_row(
+            cashflow_statement,
+            [
+                "Operating Cash Flow",
+                "Cash Flow From Continuing Operating Activities",
+                "Total Cash From Operating Activities",
+            ],
+            "Operating cash flow data is unavailable for free-cash-flow analysis.",
+        )
+        capital_expenditures = _get_first_matching_row(
+            cashflow_statement,
+            [
+                "Capital Expenditure",
+                "Capital Expenditures",
+                "Purchase Of PPE",
+            ],
+            "Capital expenditure data is unavailable for free-cash-flow analysis.",
+        )
+        if capital_expenditures.dropna().median() <= 0:
+            free_cash_flow = operating_cash_flow + capital_expenditures
+        else:
+            free_cash_flow = operating_cash_flow - capital_expenditures
+
+    if snapshot.shares_outstanding in (None, 0):
+        raise MissingDataError("Share count data is unavailable for free-cash-flow analysis.")
+
+    free_cash_flow_per_share = (free_cash_flow / snapshot.shares_outstanding).replace([np.inf, -np.inf], np.nan).dropna()
+    if free_cash_flow_per_share.empty:
+        raise MissingDataError("Free-cash-flow per share could not be derived for this analysis.")
+
+    return free_cash_flow_per_share.loc[plot_start_date:]
+
+
 def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysisResult:
     try:
-        snapshot, quarterly_income_stmt = get_ticker_snapshot(ticker)
+        snapshot, quarterly_income_stmt, quarterly_cashflow_stmt = get_ticker_snapshot(ticker)
         history = get_price_history(ticker, start_date, date.today())
         if history.empty:
             raise MissingDataError(f"No price history is available for {ticker} in the selected date range.")
@@ -316,6 +380,12 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
         return ValuationAnalysisResult(ticker=ticker, issue=to_issue(exc))
 
     result = ValuationAnalysisResult(ticker=ticker, fundamentals=fundamentals)
+    price_plot = None
+    pe_plot = None
+    eps_pct_plot = None
+    revenue_pct_plot = None
+    free_cash_flow_pct_plot = None
+    show_quarterly_bars = _history_span_days(price_series) <= 365 * 10
 
     try:
         price_plot, pe_plot, eps_plot = _compute_pe_inputs(
@@ -324,37 +394,46 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
             price_series,
             start_date,
         )
-        result.pe_figure = build_pe_chart(
-            snapshot,
-            price_plot,
-            pe_plot,
-            eps_plot,
-            show_eps_bars=_history_span_days(price_plot) <= 365 * 10,
-        )
+        eps_pct_plot = _quarterly_series_as_pct_of_price(eps_plot, price_series, start_date)
     except Exception as exc:
         result.pe_issue = to_issue(exc)
 
     try:
-        price_plot, ps_plot, revenue_plot = _compute_ps_inputs(
+        _, _, revenue_plot = _compute_ps_inputs(
             quarterly_income_stmt,
             snapshot,
             price_series,
             start_date,
         )
-        result.ps_figure = build_ps_chart(
-            snapshot,
-            price_plot,
-            ps_plot,
-            revenue_plot,
-            show_revenue_bars=_history_span_days(price_plot) <= 365 * 10,
-        )
+        revenue_pct_plot = _quarterly_series_as_pct_of_price(revenue_plot, price_series, start_date)
     except Exception as exc:
         result.ps_issue = to_issue(exc)
+
+    try:
+        free_cash_flow_plot = _compute_free_cash_flow_inputs(
+            quarterly_cashflow_stmt,
+            snapshot,
+            start_date,
+        )
+        free_cash_flow_pct_plot = _quarterly_series_as_pct_of_price(free_cash_flow_plot, price_series, start_date)
+    except Exception as exc:
+        result.fcf_issue = to_issue(exc)
+
+    if price_plot is not None and pe_plot is not None:
+        result.pe_figure = build_valuation_chart(
+            snapshot,
+            price_plot,
+            pe_plot,
+            eps_pct_plot=eps_pct_plot,
+            revenue_pct_plot=revenue_pct_plot,
+            free_cash_flow_pct_plot=free_cash_flow_pct_plot,
+            show_quarterly_bars=show_quarterly_bars,
+        )
 
     return result
 
 
-def fundamentals_to_frame(fundamentals_list: list[Fundamentals]) -> pd.DataFrame:
+def fundamentals_to_frame(fundamentals_list: list[Fundamentals], include_eps: bool = False) -> pd.DataFrame:
     if not fundamentals_list:
         return pd.DataFrame()
 
@@ -371,6 +450,8 @@ def fundamentals_to_frame(fundamentals_list: list[Fundamentals]) -> pd.DataFrame
         ("Sharpe Ratio", "sharpe_ratio"),
         ("Sharpe Ratio Adj", "sharpe_ratio_adj"),
     ]
+    if include_eps:
+        rows.insert(3, ("EPS", "trailing_eps"))
 
     columns = {}
     for fundamentals in fundamentals_list:

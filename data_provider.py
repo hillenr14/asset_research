@@ -19,7 +19,8 @@ CACHE_DIR = Path(".cache/price_history")
 CACHE_EXTENSION = ".csv"
 SNAPSHOT_CACHE_DIR = Path(".cache/ticker_snapshots")
 SNAPSHOT_CACHE_EXTENSION = ".json"
-STATEMENT_CACHE_EXTENSION = ".statement.csv"
+INCOME_STATEMENT_CACHE_EXTENSION = ".statement.csv"
+CASHFLOW_STATEMENT_CACHE_EXTENSION = ".cashflow.csv"
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
 MARKET_CLOSE_HOUR = 16
 NYSE_CALENDAR = xcals.get_calendar("XNYS")
@@ -82,12 +83,13 @@ def _cache_path_for(symbol: str) -> Path:
     return CACHE_DIR / f"{symbol.lower()}{CACHE_EXTENSION}"
 
 
-def _snapshot_cache_paths_for(symbol: str) -> tuple[Path, Path]:
+def _snapshot_cache_paths_for(symbol: str) -> tuple[Path, Path, Path]:
     SNAPSHOT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     base_name = symbol.lower()
     return (
         SNAPSHOT_CACHE_DIR / f"{base_name}{SNAPSHOT_CACHE_EXTENSION}",
-        SNAPSHOT_CACHE_DIR / f"{base_name}{STATEMENT_CACHE_EXTENSION}",
+        SNAPSHOT_CACHE_DIR / f"{base_name}{INCOME_STATEMENT_CACHE_EXTENSION}",
+        SNAPSHOT_CACHE_DIR / f"{base_name}{CASHFLOW_STATEMENT_CACHE_EXTENSION}",
     )
 
 
@@ -139,30 +141,46 @@ def _write_cached_history(symbol: str, history: pd.DataFrame) -> None:
     history_to_save.to_csv(path)
 
 
-def _read_cached_snapshot(symbol: str) -> tuple[TickerSnapshot, pd.DataFrame] | None:
-    snapshot_path, statement_path = _snapshot_cache_paths_for(symbol)
-    if not (_snapshot_path_is_fresh(snapshot_path) and _snapshot_path_is_fresh(statement_path)):
+def _read_cached_snapshot(symbol: str) -> tuple[TickerSnapshot, pd.DataFrame, pd.DataFrame] | None:
+    snapshot_path, income_statement_path, cashflow_statement_path = _snapshot_cache_paths_for(symbol)
+    if not (
+        _snapshot_path_is_fresh(snapshot_path)
+        and _snapshot_path_is_fresh(income_statement_path)
+        and _snapshot_path_is_fresh(cashflow_statement_path)
+    ):
         return None
 
     try:
         snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
         snapshot = TickerSnapshot(**snapshot_payload)
-        if statement_path.stat().st_size <= 1:
-            statement = pd.DataFrame()
+        if income_statement_path.stat().st_size <= 1:
+            income_statement = pd.DataFrame()
         else:
-            statement = pd.read_csv(statement_path, index_col=0)
-            statement.columns = pd.to_datetime(statement.columns).tz_localize(None)
-            statement = _normalize_financial_statement(statement)
+            income_statement = pd.read_csv(income_statement_path, index_col=0)
+            income_statement.columns = pd.to_datetime(income_statement.columns).tz_localize(None)
+            income_statement = _normalize_financial_statement(income_statement)
+        if cashflow_statement_path.stat().st_size <= 1:
+            cashflow_statement = pd.DataFrame()
+        else:
+            cashflow_statement = pd.read_csv(cashflow_statement_path, index_col=0)
+            cashflow_statement.columns = pd.to_datetime(cashflow_statement.columns).tz_localize(None)
+            cashflow_statement = _normalize_financial_statement(cashflow_statement)
     except Exception:
         return None
 
-    return snapshot, statement
+    return snapshot, income_statement, cashflow_statement
 
 
-def _write_cached_snapshot(symbol: str, snapshot: TickerSnapshot, quarterly_income_stmt: pd.DataFrame) -> None:
-    snapshot_path, statement_path = _snapshot_cache_paths_for(symbol)
+def _write_cached_snapshot(
+    symbol: str,
+    snapshot: TickerSnapshot,
+    quarterly_income_stmt: pd.DataFrame,
+    quarterly_cashflow_stmt: pd.DataFrame,
+) -> None:
+    snapshot_path, income_statement_path, cashflow_statement_path = _snapshot_cache_paths_for(symbol)
     snapshot_path.write_text(json.dumps(asdict(snapshot)), encoding="utf-8")
-    _normalize_financial_statement(quarterly_income_stmt).to_csv(statement_path)
+    _normalize_financial_statement(quarterly_income_stmt).to_csv(income_statement_path)
+    _normalize_financial_statement(quarterly_cashflow_stmt).to_csv(cashflow_statement_path)
 
 
 def _download_full_history(symbol: str) -> pd.DataFrame:
@@ -274,7 +292,7 @@ def _build_snapshot(ticker: str, info: dict[str, Any], fast_info: dict[str, Any]
     )
 
 
-def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame]:
+def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame, pd.DataFrame]:
     symbol = ticker.strip().upper()
     cached = _read_cached_snapshot(symbol)
     if cached is not None:
@@ -285,6 +303,7 @@ def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame]:
         info = stock.info or {}
         fast_info = _extract_fast_info(stock)
         quarterly_income_stmt = _normalize_financial_statement(stock.quarterly_income_stmt)
+        quarterly_cashflow_stmt = _normalize_financial_statement(stock.quarterly_cashflow)
         sample_history = _normalize_history_frame(stock.history(period="1mo", auto_adjust=False))
     except Exception as exc:
         raise ProviderError(f"Could not retrieve data for {symbol}.", str(exc)) from exc
@@ -299,13 +318,14 @@ def get_ticker_snapshot(ticker: str) -> tuple[TickerSnapshot, pd.DataFrame]:
     if (
         snapshot.regular_market_price is None
         and quarterly_income_stmt.empty
+        and quarterly_cashflow_stmt.empty
         and sample_history.empty
         and snapshot.short_name == symbol
     ):
         raise InvalidTickerError(f"Ticker '{symbol}' was not found or returned no usable data.")
 
-    _write_cached_snapshot(symbol, snapshot, quarterly_income_stmt)
-    return snapshot, quarterly_income_stmt
+    _write_cached_snapshot(symbol, snapshot, quarterly_income_stmt, quarterly_cashflow_stmt)
+    return snapshot, quarterly_income_stmt, quarterly_cashflow_stmt
 
 
 def warm_price_history_cache(tickers: list[str]) -> None:

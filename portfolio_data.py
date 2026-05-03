@@ -175,7 +175,7 @@ def build_holdings_analysis_table() -> pd.DataFrame:
             trailing_pe = None
         else:
             try:
-                snapshot, _ = get_ticker_snapshot(ticker)
+                snapshot, _, _ = get_ticker_snapshot(ticker)
                 description = snapshot.short_name
                 price = snapshot.regular_market_price
                 dividend_yield = _normalize_yield(snapshot.dividend_yield)

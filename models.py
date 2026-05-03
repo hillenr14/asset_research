@@ -45,6 +45,7 @@ class Fundamentals:
     price: Optional[float]
     dividend_yield: Optional[float]
     trailing_pe: Optional[float]
+    trailing_eps: Optional[float]
     asset_type: str
     start_date: Optional[date]
     end_date: Optional[date]
@@ -83,13 +84,14 @@ class ValuationAnalysisResult:
     issue: Optional[AnalysisIssue] = None
     pe_issue: Optional[AnalysisIssue] = None
     ps_issue: Optional[AnalysisIssue] = None
+    fcf_issue: Optional[AnalysisIssue] = None
 
     @property
     def status(self) -> str:
         if self.issue is not None:
             return "error"
-        if self.pe_figure is not None and self.ps_figure is not None:
+        if self.pe_figure is not None and self.pe_issue is None and self.ps_issue is None and self.fcf_issue is None:
             return "success"
-        if self.pe_figure is not None or self.ps_figure is not None:
+        if self.pe_figure is not None:
             return "partial"
         return "error"

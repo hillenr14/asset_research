@@ -153,6 +153,7 @@ def initialize_state() -> None:
     st.session_state.setdefault("dividend_show_summary", True)
     st.session_state.setdefault("valuation_show_summary", True)
     st.session_state.setdefault("selected_lookback", DEFAULT_LOOKBACK)
+    st.session_state.setdefault("selected_page", "Dividend Analysis")
     st.session_state["show_export_actions"] = False
     st.session_state.setdefault("dividend_auto_signature", None)
     st.session_state.setdefault("valuation_auto_signature", None)
@@ -240,7 +241,7 @@ def rebase_reinvested_series_for_display(history: pd.DataFrame) -> pd.DataFrame:
 
 def get_asset_label(ticker: str) -> str:
     try:
-        snapshot, _ = get_ticker_snapshot(ticker)
+        snapshot, _, _ = get_ticker_snapshot(ticker)
         if snapshot.short_name and snapshot.short_name != ticker:
             return f"{ticker} · {snapshot.short_name}"
     except Exception:
@@ -250,7 +251,7 @@ def get_asset_label(ticker: str) -> str:
 
 def get_asset_name(ticker: str) -> str:
     try:
-        snapshot, _ = get_ticker_snapshot(ticker)
+        snapshot, _, _ = get_ticker_snapshot(ticker)
         if snapshot.short_name and snapshot.short_name != ticker:
             return snapshot.short_name
     except Exception:
@@ -501,7 +502,7 @@ def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | 
     left, right = st.columns([0.9, 2.8], vertical_alignment="top")
     with left:
         if result.fundamentals is not None:
-            fundamentals_df = fundamentals_to_frame([result.fundamentals])
+            fundamentals_df = fundamentals_to_frame([result.fundamentals], include_eps=True)
             display_df = fundamentals_table_display(fundamentals_df)
             st.dataframe(
                 display_df,
@@ -519,27 +520,20 @@ def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | 
                 csv_data=dataframe_to_csv_bytes(fundamentals_df),
             )
     with right:
-        st.subheader("Price-to-Earnings (P/E) Ratio")
+        st.subheader("Valuation Overview")
         if result.pe_figure is not None:
             st.plotly_chart(result.pe_figure, width="stretch")
             render_export_controls(
-                label_prefix=f"{ticker}-pe",
-                html_name=f"{ticker.lower()}_pe_chart.html",
+                label_prefix=f"{ticker}-valuation-chart",
+                html_name=f"{ticker.lower()}_valuation_chart.html",
                 html_data=figure_to_html(result.pe_figure),
             )
         elif result.pe_issue is not None:
             st.warning(result.pe_issue.message)
-
-        st.subheader("Price-to-Sales (P/S) Ratio")
-        if result.ps_figure is not None:
-            st.plotly_chart(result.ps_figure, width="stretch")
-            render_export_controls(
-                label_prefix=f"{ticker}-ps",
-                html_name=f"{ticker.lower()}_ps_chart.html",
-                html_data=figure_to_html(result.ps_figure),
-            )
-        elif result.ps_issue is not None:
-            st.warning(result.ps_issue.message)
+        if result.ps_issue is not None:
+            st.caption(f"Revenue bar series unavailable: {result.ps_issue.message}")
+        if result.fcf_issue is not None:
+            st.caption(f"Free-cash-flow bar series unavailable: {result.fcf_issue.message}")
 
 
 def render_summary_table(mode: str, summary_df) -> None:
@@ -717,16 +711,17 @@ def render_page() -> None:
         horizontal=True,
         label_visibility="collapsed",
     )
-
-    dividend_tab, valuation_tab, portfolio_tab = st.tabs(
-        ["Dividend Analysis", "Valuation Analysis", "Holdings Analysis"]
+    selected_page = st.segmented_control(
+        "Analysis Page",
+        options=["Dividend Analysis", "Valuation Analysis", "Holdings Analysis"],
+        key="selected_page",
+        label_visibility="collapsed",
     )
-
-    with dividend_tab:
+    if selected_page == "Dividend Analysis":
         render_analysis_tab("dividend")
-    with valuation_tab:
+    elif selected_page == "Valuation Analysis":
         render_analysis_tab("valuation")
-    with portfolio_tab:
+    else:
         render_portfolio_tab()
 
 
