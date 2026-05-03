@@ -6,9 +6,12 @@ import numpy as np
 import pandas as pd
 
 from charts import build_dividend_chart, build_pe_chart, build_ps_chart
-from data_provider import get_daily_close_history, get_price_history, get_ticker_snapshot
+from data_provider import get_daily_close_history, get_full_price_history, get_price_history, get_ticker_snapshot
 from errors import MissingDataError, UnsupportedAnalysisError, to_issue
 from models import DividendAnalysisResult, Fundamentals, TickerSnapshot, ValuationAnalysisResult
+
+
+BENCHMARK_TICKER = "SPY"
 
 
 def _safe_float(value: float | int | None) -> float | None:
@@ -22,12 +25,42 @@ def _safe_float(value: float | int | None) -> float | None:
     return float(value)
 
 
+def _normalize_dividend_yield(value: float | int | None) -> float | None:
+    numeric = _safe_float(value)
+    if numeric is None:
+        return None
+    if numeric >= 0.15:
+        return numeric / 100
+    return numeric
+
+
+def _history_span_days(history: pd.DataFrame | pd.Series | None) -> int:
+    if history is None or len(history.index) < 2:
+        return 0
+    return int((pd.Timestamp(history.index.max()) - pd.Timestamp(history.index.min())).days)
+
+
+def _should_show_dividend_bars(dividends_to_plot: pd.DataFrame, history: pd.DataFrame) -> bool:
+    if dividends_to_plot.empty:
+        return False
+    if _history_span_days(history) <= 365 * 2:
+        return True
+    if len(dividends_to_plot.index) < 2:
+        return True
+    median_spacing_days = (
+        dividends_to_plot.index.to_series().diff().dropna().dt.days.median()
+    )
+    return pd.isna(median_spacing_days) or median_spacing_days > 45
+
+
 def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) -> Fundamentals:
     start_date = None
     end_date = None
     annual_return_pct = None
     annual_return_adj_pct = None
     annual_volatility_pct = None
+    alpha_vs_spy_pct = None
+    beta_vs_spy = None
     sharpe_ratio = None
     sharpe_ratio_adj = None
 
@@ -48,6 +81,8 @@ def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) 
         close_return = _safe_float(annual_return.get("Close"))
         adj_return = _safe_float(annual_return.get("Adj Close"))
 
+        alpha_vs_spy_pct, beta_vs_spy = _compute_benchmark_metrics(history, start_date, end_date)
+
         if close_volatility not in (None, 0):
             sharpe_ratio = (close_return - 0.03) / close_volatility
         if adj_volatility not in (None, 0):
@@ -57,7 +92,7 @@ def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) 
         ticker=snapshot.ticker,
         name=snapshot.short_name,
         price=snapshot.regular_market_price,
-        dividend_yield=snapshot.dividend_yield,
+        dividend_yield=_normalize_dividend_yield(snapshot.dividend_yield),
         trailing_pe=snapshot.trailing_pe,
         asset_type=snapshot.asset_type,
         start_date=start_date,
@@ -65,9 +100,47 @@ def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) 
         annual_return_pct=annual_return_pct,
         annual_return_adj_pct=annual_return_adj_pct,
         annual_volatility_pct=annual_volatility_pct,
+        alpha_vs_spy_pct=alpha_vs_spy_pct,
+        beta_vs_spy=beta_vs_spy,
         sharpe_ratio=sharpe_ratio,
         sharpe_ratio_adj=sharpe_ratio_adj,
     )
+
+
+def _compute_benchmark_metrics(
+    history: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> tuple[float | None, float | None]:
+    try:
+        benchmark_history = get_price_history(BENCHMARK_TICKER, start_date, end_date)
+    except Exception:
+        return None, None
+
+    if benchmark_history.empty:
+        return None, None
+
+    asset_returns = history["Adj Close"].pct_change()
+    benchmark_returns = benchmark_history["Adj Close"].pct_change()
+    aligned = pd.concat(
+        [
+            asset_returns.rename("asset"),
+            benchmark_returns.rename("benchmark"),
+        ],
+        axis=1,
+    ).dropna()
+    if len(aligned) < 2:
+        return None, None
+
+    benchmark_variance = aligned["benchmark"].var()
+    if benchmark_variance in (None, 0) or pd.isna(benchmark_variance):
+        return None, None
+
+    covariance = aligned["asset"].cov(aligned["benchmark"])
+    beta = covariance / benchmark_variance
+    alpha_daily = aligned["asset"].mean() - beta * aligned["benchmark"].mean()
+    alpha_annual_pct = alpha_daily * 252 * 100
+    return _safe_float(alpha_annual_pct), _safe_float(beta)
 
 
 def _get_first_matching_row(
@@ -92,19 +165,42 @@ def _build_share_series(statement: pd.DataFrame, snapshot: TickerSnapshot, refer
     return pd.Series(snapshot.shares_outstanding, index=reference_index)
 
 
-def _compute_dividend_labels(dividends_to_plot: pd.DataFrame, history: pd.DataFrame) -> list[str]:
-    dividend_count_1y = len(
-        history[
-            (history.index >= history.index.max() - pd.DateOffset(years=1))
-            & (history["Dividends"] > 0)
-        ]
-    )
-    if dividend_count_1y == 0:
+def _payments_per_year(dividend_history: pd.DataFrame) -> int:
+    dividends = dividend_history[dividend_history["Dividends"] > 0]
+    if dividends.empty:
+        return 0
+
+    trailing_year_start = dividends.index.max() - pd.DateOffset(years=1)
+    trailing_year_count = int((dividends.index >= trailing_year_start).sum())
+    if trailing_year_count > 0:
+        return trailing_year_count
+
+    if len(dividends.index) < 2:
+        return 1
+
+    median_spacing_days = dividends.index.to_series().diff().dropna().dt.days.median()
+    if pd.isna(median_spacing_days):
+        return 1
+    if median_spacing_days <= 40:
+        return 12
+    if median_spacing_days <= 120:
+        return 4
+    if median_spacing_days <= 220:
+        return 2
+    return 1
+
+
+def _compute_dividend_labels(dividends_to_plot: pd.DataFrame, dividend_history: pd.DataFrame) -> list[str]:
+    if dividends_to_plot.empty:
+        return []
+    payments_per_year = _payments_per_year(dividend_history)
+    if payments_per_year <= 0:
         return []
 
     return [
-        f"{(dividend * 100 * dividend_count_1y) / close_price:.2f}%"
+        f"{(100 * dividend * payments_per_year) / close_price:.2f}%"
         for dividend, close_price in zip(dividends_to_plot["Dividends"], dividends_to_plot["Close"])
+        if close_price not in (None, 0) and not pd.isna(close_price)
     ]
 
 
@@ -114,6 +210,7 @@ def analyze_dividend_ticker(ticker: str, start_date: date) -> DividendAnalysisRe
         history = get_price_history(ticker, start_date, date.today())
         if history.empty:
             raise MissingDataError(f"No price history is available for {ticker} in the selected date range.")
+        full_history = get_full_price_history(ticker)
 
         fundamentals = _build_fundamentals(snapshot, history)
         plot_history = history.copy()
@@ -121,8 +218,14 @@ def analyze_dividend_ticker(ticker: str, start_date: date) -> DividendAnalysisRe
             plot_history["Adj Close"] + (plot_history["Close"].iloc[0] - plot_history["Adj Close"].iloc[0])
         )
         dividends_to_plot = plot_history[plot_history["Dividends"] > 0]
-        bar_labels = _compute_dividend_labels(dividends_to_plot, plot_history)
-        figure = build_dividend_chart(snapshot, plot_history, dividends_to_plot, bar_labels)
+        bar_labels = _compute_dividend_labels(dividends_to_plot, full_history)
+        figure = build_dividend_chart(
+            snapshot,
+            plot_history,
+            dividends_to_plot,
+            bar_labels,
+            show_dividend_bars=_should_show_dividend_bars(dividends_to_plot, plot_history),
+        )
 
         return DividendAnalysisResult(
             ticker=ticker,
@@ -221,7 +324,13 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
             price_series,
             start_date,
         )
-        result.pe_figure = build_pe_chart(snapshot, price_plot, pe_plot, eps_plot)
+        result.pe_figure = build_pe_chart(
+            snapshot,
+            price_plot,
+            pe_plot,
+            eps_plot,
+            show_eps_bars=_history_span_days(price_plot) <= 365 * 10,
+        )
     except Exception as exc:
         result.pe_issue = to_issue(exc)
 
@@ -232,7 +341,13 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
             price_series,
             start_date,
         )
-        result.ps_figure = build_ps_chart(snapshot, price_plot, ps_plot, revenue_plot)
+        result.ps_figure = build_ps_chart(
+            snapshot,
+            price_plot,
+            ps_plot,
+            revenue_plot,
+            show_revenue_bars=_history_span_days(price_plot) <= 365 * 10,
+        )
     except Exception as exc:
         result.ps_issue = to_issue(exc)
 
@@ -251,6 +366,8 @@ def fundamentals_to_frame(fundamentals_list: list[Fundamentals]) -> pd.DataFrame
         ("Annual Return (%)", "annual_return_pct"),
         ("Annual Return Adj (%)", "annual_return_adj_pct"),
         ("Annual Volatility (%)", "annual_volatility_pct"),
+        ("Alpha vs SPY (%)", "alpha_vs_spy_pct"),
+        ("Beta vs SPY", "beta_vs_spy"),
         ("Sharpe Ratio", "sharpe_ratio"),
         ("Sharpe Ratio Adj", "sharpe_ratio_adj"),
     ]
@@ -258,7 +375,11 @@ def fundamentals_to_frame(fundamentals_list: list[Fundamentals]) -> pd.DataFrame
     columns = {}
     for fundamentals in fundamentals_list:
         columns[fundamentals.ticker] = {
-            label: getattr(fundamentals, field_name)
+            label: (
+                getattr(fundamentals, field_name) * 100
+                if field_name == "dividend_yield" and getattr(fundamentals, field_name) is not None
+                else getattr(fundamentals, field_name)
+            )
             for label, field_name in rows
         }
 

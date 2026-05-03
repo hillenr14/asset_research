@@ -51,6 +51,8 @@ class Fundamentals:
     annual_return_pct: Optional[float] = None
     annual_return_adj_pct: Optional[float] = None
     annual_volatility_pct: Optional[float] = None
+    alpha_vs_spy_pct: Optional[float] = None
+    beta_vs_spy: Optional[float] = None
     sharpe_ratio: Optional[float] = None
     sharpe_ratio_adj: Optional[float] = None
 

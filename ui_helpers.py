@@ -5,7 +5,7 @@ from datetime import date
 import pandas as pd
 import plotly.graph_objects as go
 
-from models import DividendAnalysisResult, ValuationAnalysisResult
+from models import DividendAnalysisResult, Fundamentals, ValuationAnalysisResult
 
 
 def normalize_single_ticker(text: str) -> str:
@@ -49,18 +49,18 @@ def validate_single_ticker(ticker: str) -> list[str]:
 
 
 def format_dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    display_df = df.copy()
+    def _format_value(value):
+        if isinstance(value, (int, float)):
+            return f"{value:.2f}" if not pd.isna(value) else "N/A"
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "N/A"
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+
+    display_df = df.copy().astype("object")
     for column in display_df.columns:
-        for index in display_df.index:
-            value = display_df.loc[index, column]
-            if isinstance(value, (int, float)):
-                display_df.loc[index, column] = f"{value:.2f}" if not pd.isna(value) else "N/A"
-            elif value is None or (isinstance(value, float) and pd.isna(value)):
-                display_df.loc[index, column] = "N/A"
-            elif hasattr(value, "isoformat"):
-                display_df.loc[index, column] = value.isoformat()
-            else:
-                display_df.loc[index, column] = str(value)
+        display_df[column] = display_df[column].map(_format_value)
     return display_df
 
 
@@ -106,3 +106,27 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 def figure_to_html(figure: go.Figure) -> str:
     return figure.to_html(include_plotlyjs="cdn")
+
+
+def build_analysis_summary_frame(fundamentals_list: list[Fundamentals]) -> pd.DataFrame:
+    records: list[dict[str, object]] = []
+    for fundamentals in fundamentals_list:
+        records.append(
+            {
+                "Ticker": fundamentals.ticker,
+                "Name": fundamentals.name,
+                "Px": fundamentals.price,
+                "Yld %": (fundamentals.dividend_yield * 100) if fundamentals.dividend_yield is not None else None,
+                "P/E": fundamentals.trailing_pe,
+                "Typ": fundamentals.asset_type,
+                "Ret %": fundamentals.annual_return_pct,
+                "Ret Adj %": fundamentals.annual_return_adj_pct,
+                "Vol %": fundamentals.annual_volatility_pct,
+                "Alpha %": fundamentals.alpha_vs_spy_pct,
+                "Beta": fundamentals.beta_vs_spy,
+                "Shp": fundamentals.sharpe_ratio,
+                "Shp Adj": fundamentals.sharpe_ratio_adj,
+            }
+        )
+
+    return pd.DataFrame(records)

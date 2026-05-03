@@ -6,6 +6,18 @@ from plotly.subplots import make_subplots
 
 from models import TickerSnapshot
 
+TARGET_BAR_WIDTH_PX = 6
+ESTIMATED_PLOT_WIDTH_PX = 950
+
+
+def _bar_width_ms(reference_index: pd.Index) -> float:
+    if len(reference_index) < 2:
+        return 6 * 24 * 60 * 60 * 1000
+    start = pd.Timestamp(reference_index.min())
+    end = pd.Timestamp(reference_index.max())
+    span_ms = max((end - start).total_seconds() * 1000, 24 * 60 * 60 * 1000)
+    return max(span_ms * TARGET_BAR_WIDTH_PX / ESTIMATED_PLOT_WIDTH_PX, 1.0)
+
 
 def _apply_plotly_layout(
     fig: go.Figure,
@@ -57,8 +69,10 @@ def build_ps_chart(
     price_plot: pd.Series,
     ps_plot: pd.Series,
     revenue_plot: pd.Series,
+    show_revenue_bars: bool = True,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+    bar_width_ms = _bar_width_ms(price_plot.index)
     fig.add_trace(
         go.Scatter(
             x=ps_plot.index,
@@ -81,17 +95,18 @@ def build_ps_chart(
         ),
         secondary_y=True,
     )
-    fig.add_trace(
-        go.Bar(
-            x=revenue_plot.index,
-            y=revenue_plot.values,
-            name="Quarterly Revenue",
-            yaxis="y3",
-            marker=dict(color="rgba(167, 139, 250, 0.55)"),
-            width=10 * 24 * 60 * 60 * 1000,
-            hovertemplate="Revenue=%{y:,.0f}<extra></extra>",
+    if show_revenue_bars:
+        fig.add_trace(
+            go.Bar(
+                x=revenue_plot.index,
+                y=revenue_plot.values,
+                name="Quarterly Revenue",
+                yaxis="y3",
+                marker=dict(color="rgba(167, 139, 250, 0.55)"),
+                width=bar_width_ms,
+                hovertemplate="Revenue=%{y:,.0f}<extra></extra>",
+            )
         )
-    )
     return _apply_plotly_layout(
         fig,
         f"{snapshot.short_name} ({snapshot.ticker}) - Price, Trailing P/S, and Quarterly Revenue",
@@ -114,8 +129,10 @@ def build_pe_chart(
     price_plot: pd.Series,
     pe_plot: pd.Series,
     eps_plot: pd.Series,
+    show_eps_bars: bool = True,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+    bar_width_ms = _bar_width_ms(price_plot.index)
     fig.add_trace(
         go.Scatter(
             x=pe_plot.index,
@@ -138,17 +155,18 @@ def build_pe_chart(
         ),
         secondary_y=True,
     )
-    fig.add_trace(
-        go.Bar(
-            x=eps_plot.index,
-            y=eps_plot.values,
-            name="Quarterly EPS",
-            yaxis="y3",
-            marker=dict(color="rgba(52, 211, 153, 0.55)"),
-            width=10 * 24 * 60 * 60 * 1000,
-            hovertemplate="EPS=%{y:.2f}<extra></extra>",
+    if show_eps_bars:
+        fig.add_trace(
+            go.Bar(
+                x=eps_plot.index,
+                y=eps_plot.values,
+                name="Quarterly EPS",
+                yaxis="y3",
+                marker=dict(color="rgba(52, 211, 153, 0.55)"),
+                width=bar_width_ms,
+                hovertemplate="EPS=%{y:.2f}<extra></extra>",
+            )
         )
-    )
     return _apply_plotly_layout(
         fig,
         f"{snapshot.short_name} ({snapshot.ticker}) - Price, Trailing P/E, and Quarterly EPS",
@@ -171,8 +189,10 @@ def build_dividend_chart(
     price_history: pd.DataFrame,
     dividends_to_plot: pd.DataFrame,
     bar_labels: list[str],
+    show_dividend_bars: bool = True,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+    bar_width_ms = _bar_width_ms(price_history.index)
     fig.add_trace(
         go.Scatter(
             x=price_history.index,
@@ -195,22 +215,23 @@ def build_dividend_chart(
         ),
         secondary_y=False,
     )
-    fig.add_trace(
-        go.Bar(
-            x=dividends_to_plot.index,
-            y=dividends_to_plot["Dividends"],
-            name="Dividends",
-            marker=dict(color="rgba(52, 211, 153, 0.55)"),
-            text=bar_labels if bar_labels else None,
-            textposition="outside",
-            textfont=dict(size=12),
-            constraintext="none",
-            cliponaxis=False,
-            width=10 * 24 * 60 * 60 * 1000,
-            hovertemplate="Dividend=$%{y:.4f}<extra></extra>",
-        ),
-        secondary_y=True,
-    )
+    if show_dividend_bars:
+        fig.add_trace(
+            go.Bar(
+                x=dividends_to_plot.index,
+                y=dividends_to_plot["Dividends"],
+                name="Dividends",
+                marker=dict(color="rgba(52, 211, 153, 0.55)"),
+                text=bar_labels if bar_labels else None,
+                textposition="outside",
+                textfont=dict(size=12),
+                constraintext="none",
+                cliponaxis=False,
+                width=bar_width_ms,
+                hovertemplate="Dividend=$%{y:.4f}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
     fig = _apply_plotly_layout(
         fig,
         f"{snapshot.short_name} ({snapshot.ticker}) - Adjusted Close and Dividends",
@@ -225,8 +246,10 @@ def build_holdings_portfolio_chart(
     portfolio_value_history: pd.DataFrame,
     monthly_income_history: pd.DataFrame,
     title: str = "Holdings Portfolio - Total Value and Monthly Income",
+    show_income_bars: bool = True,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+    bar_width_ms = _bar_width_ms(portfolio_value_history.index)
     fig.add_trace(
         go.Scatter(
             x=portfolio_value_history.index,
@@ -255,22 +278,23 @@ def build_holdings_portfolio_chart(
         f"${value:,.2f}" if value > 0 else ""
         for value in monthly_income_history["Income"].fillna(0.0)
     ]
-    fig.add_trace(
-        go.Bar(
-            x=monthly_income_history.index,
-            y=monthly_income_history["Income"],
-            name="Monthly Income",
-            marker=dict(color="rgba(52, 211, 153, 0.55)"),
-            text=income_labels,
-            textposition="outside",
-            textfont=dict(size=12),
-            constraintext="none",
-            cliponaxis=False,
-            width=10 * 24 * 60 * 60 * 1000,
-            hovertemplate="Monthly Income=$%{y:,.2f}<extra></extra>",
-        ),
-        secondary_y=True,
-    )
+    if show_income_bars:
+        fig.add_trace(
+            go.Bar(
+                x=monthly_income_history.index,
+                y=monthly_income_history["Income"],
+                name="Monthly Income",
+                marker=dict(color="rgba(52, 211, 153, 0.55)"),
+                text=income_labels,
+                textposition="outside",
+                textfont=dict(size=12),
+                constraintext="none",
+                cliponaxis=False,
+                width=bar_width_ms,
+                hovertemplate="Monthly Income=$%{y:,.2f}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
 
     fig = _apply_plotly_layout(
         fig,

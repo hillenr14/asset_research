@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from typing import Callable
 
+import pandas as pd
 import streamlit as st
 
 from charts import build_holdings_portfolio_chart
-from config import load_config, rolling_analysis_start_date, save_config
-from data_provider import get_ticker_snapshot
+from config import (
+    DEFAULT_LOOKBACK,
+    LOOKBACK_OPTIONS,
+    load_config,
+    lookback_exceeds_years,
+    lookback_start_date,
+    rolling_analysis_start_date,
+    save_config,
+)
+from data_provider import clear_in_memory_price_history_cache, get_ticker_snapshot, warm_price_history_cache
 from portfolio_data import (
     PORTFOLIO_DOCUMENT_PATH,
     PORTFOLIO_SHEET_NAME,
@@ -15,11 +24,13 @@ from portfolio_data import (
     build_holdings_portfolio_histories,
     compute_holdings_totals,
     format_portfolio_holdings_for_display,
+    portfolio_history_tickers,
     refresh_holdings_analysis_data,
 )
-from metrics import analyze_dividend_ticker, analyze_valuation_ticker, fundamentals_to_frame
+from metrics import BENCHMARK_TICKER, analyze_dividend_ticker, analyze_valuation_ticker, fundamentals_to_frame
 from models import AnalysisSettings, AppConfig, DividendAnalysisResult, ValuationAnalysisResult
 from ui_helpers import (
+    build_analysis_summary_frame,
     dataframe_to_csv_bytes,
     figure_to_html,
     format_dataframe_for_display,
@@ -120,7 +131,7 @@ def inject_page_styles() -> None:
 def render_page_header() -> None:
     st.markdown("##### :material/query_stats: Stock research dashboard")
     st.markdown(
-        '<div class="app-subtitle">Analyze dividend and valuation signals for individual assets with a two-year rolling history window and persistent local price caching.</div>',
+        '<div class="app-subtitle">Analyze dividend, valuation, and holdings data with full-history local caching and a global lookback control.</div>',
         unsafe_allow_html=True,
     )
 
@@ -139,10 +150,14 @@ def initialize_state() -> None:
     st.session_state.setdefault("valuation_selected_ticker", active_config.valuation_analysis.tickers[0] if active_config.valuation_analysis.tickers else None)
     st.session_state.setdefault("dividend_add_ticker", "")
     st.session_state.setdefault("valuation_add_ticker", "")
+    st.session_state.setdefault("dividend_show_summary", True)
+    st.session_state.setdefault("valuation_show_summary", True)
+    st.session_state.setdefault("selected_lookback", DEFAULT_LOOKBACK)
     st.session_state["show_export_actions"] = False
     st.session_state.setdefault("dividend_auto_signature", None)
     st.session_state.setdefault("valuation_auto_signature", None)
     st.session_state.setdefault("holdings_refreshed_on_load", False)
+    st.session_state.setdefault("market_data_warmed_on_load", False)
 
 
 def current_config() -> AppConfig:
@@ -154,7 +169,73 @@ def persist_current_config() -> None:
 
 
 def analysis_start_date():
-    return rolling_analysis_start_date()
+    return lookback_start_date(current_lookback())
+
+
+def current_lookback() -> str:
+    return st.session_state.get("selected_lookback", DEFAULT_LOOKBACK)
+
+
+def all_market_history_tickers() -> list[str]:
+    config = current_config()
+    tickers = (
+        config.dividend_analysis.tickers
+        + config.valuation_analysis.tickers
+        + portfolio_history_tickers()
+        + [BENCHMARK_TICKER]
+    )
+    ordered_tickers: list[str] = []
+    seen: set[str] = set()
+    for ticker in tickers:
+        symbol = ticker.strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        ordered_tickers.append(symbol)
+    return ordered_tickers
+
+
+def warm_market_data_on_load() -> None:
+    if st.session_state.get("market_data_warmed_on_load", False):
+        return
+
+    refresh_holdings_analysis_data()
+    clear_in_memory_price_history_cache()
+    tickers = all_market_history_tickers()
+    if tickers:
+        with st.spinner("Refreshing market data cache and loading full histories..."):
+            warm_price_history_cache(tickers)
+    st.session_state["market_data_warmed_on_load"] = True
+    st.session_state["holdings_refreshed_on_load"] = True
+
+
+def slice_history_for_current_lookback(history: object):
+    if history is None or getattr(history, "empty", True):
+        return history
+    start_ts = pd.Timestamp(analysis_start_date())
+    return history.loc[history.index >= start_ts].copy()
+
+
+def dataframe_height(row_count: int, visible_rows: int | None = None) -> int:
+    rows = row_count if visible_rows is None else min(row_count, visible_rows)
+    return max(140, 40 + rows * 35)
+
+
+def fundamentals_table_display(detail_df: pd.DataFrame) -> pd.DataFrame:
+    display_df = format_dataframe_for_display(detail_df).reset_index()
+    return display_df.rename(columns={"index": "Metric"})
+
+
+def rebase_reinvested_series_for_display(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty or "Reinvested Portfolio Value" not in history.columns:
+        return history
+    rebased = history.copy()
+    start_value = rebased["Portfolio Value"].iloc[0]
+    reinvested_start = rebased["Reinvested Portfolio Value"].iloc[0]
+    rebased["Reinvested Portfolio Value"] = (
+        rebased["Reinvested Portfolio Value"] - reinvested_start + start_value
+    )
+    return rebased
 
 
 def get_asset_label(ticker: str) -> str:
@@ -212,6 +293,7 @@ def add_ticker(mode: str) -> None:
     persist_current_config()
     st.session_state[input_key] = ""
     st.session_state[f"{mode}_selected_ticker"] = ticker
+    st.session_state[f"{mode}_show_summary"] = False
     analyze_single_ticker(mode, ticker)
 
 
@@ -224,6 +306,7 @@ def remove_ticker(mode: str, ticker: str) -> None:
 
     result_key = f"{mode}_results"
     st.session_state[result_key].pop(ticker, None)
+    st.session_state[f"{mode}_show_summary"] = False
     ensure_ticker_selection(mode)
 
 
@@ -264,7 +347,7 @@ def analyze_all_tickers(mode: str) -> None:
 
 def sync_initial_analyses(mode: str) -> None:
     tickers = getattr(current_config(), f"{mode}_analysis").tickers
-    signature = tuple(tickers)
+    signature = (tuple(tickers), current_lookback())
     signature_key = f"{mode}_auto_signature"
     if st.session_state.get(signature_key) == signature:
         return
@@ -305,7 +388,11 @@ def render_asset_list(mode: str) -> None:
 
     pane_title = "Dividend Assets" if mode == "dividend" else "Valuation Assets"
     st.markdown(f'<div class="pane-title">{pane_title}</div>', unsafe_allow_html=True)
-    st.caption(f"Historical window: {settings.start_date.isoformat()} to today")
+    st.caption(f"Lookback: {current_lookback()}")
+
+    if st.button("Summary", key=f"{mode}-summary-button", width="stretch"):
+        st.session_state[f"{mode}_show_summary"] = True
+        st.rerun()
 
     add_cols = st.columns([1.1, 4.4])
     with add_cols[0]:
@@ -336,6 +423,7 @@ def render_asset_list(mode: str) -> None:
                 type="primary" if st.session_state.get(f"{mode}_selected_ticker") == ticker else "secondary",
             ):
                 st.session_state[f"{mode}_selected_ticker"] = ticker
+                st.session_state[f"{mode}_show_summary"] = False
                 analyze_single_ticker(mode, ticker)
                 st.rerun()
         with row[2]:
@@ -366,9 +454,19 @@ def render_dividend_main(result: DividendAnalysisResult | None, ticker: str | No
 
     st.markdown('<div class="pane-copy">Selected asset output appears here after you click a ticker in the left pane.</div>', unsafe_allow_html=True)
     detail_df = fundamentals_to_frame([result.fundamentals])
-    left, right = st.columns([1.05, 2.65], vertical_alignment="top")
+    display_df = fundamentals_table_display(detail_df)
+    left, right = st.columns([0.9, 2.8], vertical_alignment="top")
     with left:
-        st.dataframe(format_dataframe_for_display(detail_df), width="stretch")
+        st.dataframe(
+            display_df,
+            width="stretch",
+            height=dataframe_height(len(display_df)),
+            hide_index=True,
+            column_config={
+                "Metric": st.column_config.TextColumn("Metric", width="medium"),
+                ticker: st.column_config.TextColumn(ticker, width="small"),
+            },
+        )
         render_export_controls(
             label_prefix=f"{ticker}-dividend",
             csv_name=f"{ticker.lower()}_dividend_fundamentals.csv",
@@ -400,11 +498,21 @@ def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | 
         return
 
     st.markdown('<div class="pane-copy">Selected asset output appears here after you click a ticker in the left pane.</div>', unsafe_allow_html=True)
-    left, right = st.columns([1.05, 2.65], vertical_alignment="top")
+    left, right = st.columns([0.9, 2.8], vertical_alignment="top")
     with left:
         if result.fundamentals is not None:
             fundamentals_df = fundamentals_to_frame([result.fundamentals])
-            st.dataframe(format_dataframe_for_display(fundamentals_df), width="stretch")
+            display_df = fundamentals_table_display(fundamentals_df)
+            st.dataframe(
+                display_df,
+                width="stretch",
+                height=dataframe_height(len(display_df)),
+                hide_index=True,
+                column_config={
+                    "Metric": st.column_config.TextColumn("Metric", width="medium"),
+                    ticker: st.column_config.TextColumn(ticker, width="small"),
+                },
+            )
             render_export_controls(
                 label_prefix=f"{ticker}-valuation-fundamentals",
                 csv_name=f"{ticker.lower()}_valuation_fundamentals.csv",
@@ -434,6 +542,70 @@ def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | 
             st.warning(result.ps_issue.message)
 
 
+def render_summary_table(mode: str, summary_df) -> None:
+    selection = st.dataframe(
+        summary_df,
+        width="stretch",
+        height=dataframe_height(len(summary_df), visible_rows=20),
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"{mode}-summary-table",
+        column_config={
+            "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+            "Name": st.column_config.TextColumn("Name", width="medium"),
+            "Px": st.column_config.NumberColumn("Px", format="%.2f", width="small"),
+            "Yld %": st.column_config.NumberColumn("Yld %", format="%.2f", width="small"),
+            "P/E": st.column_config.NumberColumn("P/E", format="%.2f", width="small"),
+            "Typ": st.column_config.TextColumn("Typ", width="small"),
+            "Ret %": st.column_config.NumberColumn("Ret %", format="%.2f", width="small"),
+            "Ret Adj %": st.column_config.NumberColumn("Ret Adj %", format="%.2f", width="small"),
+            "Vol %": st.column_config.NumberColumn("Vol %", format="%.2f", width="small"),
+            "Alpha %": st.column_config.NumberColumn("Alpha %", format="%.2f", width="small"),
+            "Beta": st.column_config.NumberColumn("Beta", format="%.2f", width="small"),
+            "Shp": st.column_config.NumberColumn("Shp", format="%.2f", width="small"),
+            "Shp Adj": st.column_config.NumberColumn("Shp Adj", format="%.2f", width="small"),
+        },
+    )
+
+    selected_rows = []
+    if selection is not None:
+        if hasattr(selection, "selection") and hasattr(selection.selection, "rows"):
+            selected_rows = list(selection.selection.rows)
+        elif isinstance(selection, dict):
+            selected_rows = list(selection.get("selection", {}).get("rows", []))
+
+    if selected_rows:
+        row_index = selected_rows[0]
+        ticker = str(summary_df.iloc[row_index]["Ticker"])
+        st.session_state[f"{mode}_selected_ticker"] = ticker
+        st.session_state[f"{mode}_show_summary"] = False
+        analyze_single_ticker(mode, ticker)
+        st.rerun()
+
+
+def render_analysis_summary(mode: str) -> None:
+    tickers = getattr(current_config(), f"{mode}_analysis").tickers
+    results = st.session_state[f"{mode}_results"]
+    fundamentals_list = [
+        results[ticker].fundamentals
+        for ticker in tickers
+        if ticker in results and results[ticker].fundamentals is not None
+    ]
+    if not fundamentals_list:
+        st.info("No summary data is available yet for this group.")
+        return
+
+    mode_label = "Dividend" if mode == "dividend" else "Valuation"
+    st.header(f"{mode_label} Summary")
+    st.markdown(
+        '<div class="pane-copy">Summary metrics for all analyzed tickers in this group.</div>',
+        unsafe_allow_html=True,
+    )
+    summary_df = build_analysis_summary_frame(fundamentals_list)
+    render_summary_table(mode, summary_df)
+
+
 def render_portfolio_tab() -> None:
     if not st.session_state.get("holdings_refreshed_on_load", False):
         refresh_holdings_analysis_data()
@@ -461,6 +633,7 @@ def render_portfolio_tab() -> None:
                 st.dataframe(
                     format_portfolio_holdings_for_display(holdings_df),
                     width="stretch",
+                    height=dataframe_height(len(holdings_df), visible_rows=20),
                     hide_index=True,
                 )
                 st.markdown(
@@ -474,25 +647,33 @@ def render_portfolio_tab() -> None:
                 )
                 portfolio_histories = build_holdings_portfolio_histories()
                 portfolio_value_history, monthly_income_history = portfolio_histories["actual"]
+                portfolio_value_history = slice_history_for_current_lookback(portfolio_value_history)
+                portfolio_value_history = rebase_reinvested_series_for_display(portfolio_value_history)
+                monthly_income_history = slice_history_for_current_lookback(monthly_income_history)
                 if not portfolio_value_history.empty:
                     st.divider()
-                    st.subheader("One-Year Portfolio Performance")
+                    st.subheader("Portfolio Performance")
                     st.plotly_chart(
                         build_holdings_portfolio_chart(
                             portfolio_value_history,
                             monthly_income_history,
                             title="Holdings Portfolio - Actual Held Period",
+                            show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
                         ),
                         width="stretch",
                     )
                 full_year_value_history, full_year_income_history = portfolio_histories["full_year"]
+                full_year_value_history = slice_history_for_current_lookback(full_year_value_history)
+                full_year_value_history = rebase_reinvested_series_for_display(full_year_value_history)
+                full_year_income_history = slice_history_for_current_lookback(full_year_income_history)
                 if not full_year_value_history.empty:
-                    st.subheader("One-Year Portfolio Performance Assuming Current Holdings Were Held All Year")
+                    st.subheader("Portfolio Performance Assuming Current Holdings Were Held All Period")
                     st.plotly_chart(
                         build_holdings_portfolio_chart(
                             full_year_value_history,
                             full_year_income_history,
-                            title="Holdings Portfolio - Current Holdings Held for Full Year",
+                            title="Holdings Portfolio - Current Holdings Held for Full Period",
+                            show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
                         ),
                         width="stretch",
                     )
@@ -516,7 +697,9 @@ def render_analysis_tab(mode: str) -> None:
         selected_ticker = st.session_state.get(f"{mode}_selected_ticker")
         result = st.session_state[f"{mode}_results"].get(selected_ticker) if selected_ticker else None
         with detail_pane:
-            if mode == "dividend":
+            if st.session_state.get(f"{mode}_show_summary", False):
+                render_analysis_summary(mode)
+            elif mode == "dividend":
                 render_dividend_main(result, selected_ticker)
             else:
                 render_valuation_main(result, selected_ticker)
@@ -525,7 +708,15 @@ def render_analysis_tab(mode: str) -> None:
 def render_page() -> None:
     inject_page_styles()
     render_page_header()
+    warm_market_data_on_load()
     st.caption("Ticker lists are saved in `config.json`. Historical price data is cached in `.cache/`.")
+    st.radio(
+        "Lookback",
+        options=LOOKBACK_OPTIONS,
+        key="selected_lookback",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
     dividend_tab, valuation_tab, portfolio_tab = st.tabs(
         ["Dividend Analysis", "Valuation Analysis", "Holdings Analysis"]

@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from numbers_parser import Document
 
-from data_provider import get_price_history, get_ticker_snapshot
+from data_provider import get_full_price_history, get_ticker_snapshot
 from errors import MissingDataError, ProviderError
 
 
@@ -20,7 +20,6 @@ PORTFOLIO_CACHE_TTL_SECONDS = 86400
 PORTFOLIO_SOURCE_COLUMNS = ["Ticker", "Type", "Loc", "Quantity", "Buy date", "Bought at"]
 CASH_PRICE = 1.0
 CASH_YIELD = 0.035
-PORTFOLIO_HISTORY_LOOKBACK_DAYS = 365
 
 
 def _normalize_portfolio_value(value):
@@ -75,6 +74,17 @@ def _load_holdings_table_from_numbers(path: Path) -> pd.DataFrame:
 def load_portfolio_holdings() -> pd.DataFrame:
     holdings = _load_holdings_table_from_numbers(PORTFOLIO_DOCUMENT_PATH)
     return holdings
+
+
+def portfolio_history_tickers() -> list[str]:
+    holdings = load_portfolio_holdings()
+    if holdings.empty:
+        return []
+    tickers = holdings.loc[
+        holdings["Type"].astype(str).str.strip().str.lower() != "cash",
+        "Ticker",
+    ]
+    return [ticker for ticker in tickers.astype(str).str.strip().str.upper().tolist() if ticker]
 
 
 def _coerce_float(value):
@@ -233,7 +243,39 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
     holdings["Buy Date"] = holdings["Buy Date"].map(_coerce_date)
 
     end_date = date.today()
-    start_date = end_date - timedelta(days=PORTFOLIO_HISTORY_LOOKBACK_DAYS)
+    history_starts: list[date] = []
+    non_cash_histories: dict[str, pd.DataFrame] = {}
+    for _, row in holdings.iterrows():
+        ticker = str(row.get("Ticker", "")).strip().upper()
+        asset_type = str(row.get("Type", "")).strip().lower()
+        buy_date = row.get("Buy Date")
+
+        if asset_type == "cash":
+            if buy_date:
+                history_starts.append(buy_date)
+            continue
+        if not ticker:
+            continue
+        try:
+            history = get_full_price_history(ticker)
+        except Exception:
+            continue
+        if history.empty:
+            continue
+        non_cash_histories[ticker] = history
+        history_starts.append(history.index.min().date())
+        if buy_date:
+            history_starts.append(buy_date)
+
+    if not history_starts:
+        empty_value = pd.DataFrame(columns=["Portfolio Value"])
+        empty_income = pd.DataFrame(columns=["Income"])
+        return {
+            "actual": (empty_value.copy(), empty_income.copy()),
+            "full_year": (empty_value.copy(), empty_income.copy()),
+        }
+
+    start_date = min(history_starts)
     full_index = pd.date_range(start=start_date, end=end_date, freq="D")
     actual_total_value = pd.Series(0.0, index=full_index, dtype="float64")
     actual_total_income = pd.Series(0.0, index=full_index, dtype="float64")
@@ -267,12 +309,8 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
                 quantity * CASH_PRICE,
             )
         else:
-            try:
-                history = get_price_history(ticker, start_date, end_date)
-            except Exception:
-                continue
-
-            if history.empty:
+            history = non_cash_histories.get(ticker)
+            if history is None or history.empty:
                 continue
 
             close_series = history["Close"].dropna()

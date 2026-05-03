@@ -8,10 +8,38 @@ from models import AnalysisSettings, AppConfig
 
 CONFIG_FILE = "config.json"
 ROLLING_LOOKBACK_DAYS = 365 * 2
+DEFAULT_LOOKBACK = "2y"
+LOOKBACK_OPTIONS = ["1w", "1m", "3m", "6m", "1y", "2y", "5y", "10y", "all"]
+LOOKBACK_DAY_MAP = {
+    "1w": 7,
+    "1m": 30,
+    "3m": 91,
+    "6m": 182,
+    "1y": 365,
+    "2y": 365 * 2,
+    "5y": 365 * 5,
+    "10y": 365 * 10,
+    "all": None,
+}
 
 
 def rolling_analysis_start_date() -> date:
     return date.today() - timedelta(days=ROLLING_LOOKBACK_DAYS)
+
+
+def lookback_start_date(lookback: str, end_date: date | None = None) -> date:
+    effective_end_date = end_date or date.today()
+    days = LOOKBACK_DAY_MAP.get(lookback, LOOKBACK_DAY_MAP[DEFAULT_LOOKBACK])
+    if days is None:
+        return date(1900, 1, 1)
+    return effective_end_date - timedelta(days=days)
+
+
+def lookback_exceeds_years(lookback: str, years: int) -> bool:
+    days = LOOKBACK_DAY_MAP.get(lookback, LOOKBACK_DAY_MAP[DEFAULT_LOOKBACK])
+    if days is None:
+        return True
+    return days > years * 365
 
 
 def default_config() -> AppConfig:

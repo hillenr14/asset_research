@@ -1,7 +1,11 @@
 # TODO
 
+## NEW
+
 ## Completed
 
+- Added a global lookback control (`1w`, `1m`, `3m`, `6m`, `1y`, `2y`, `5y`, `10y`, `all`) above the tabs and updated the app to slice all analysis views from full cached histories in memory.
+- Changed ticker CSV files to behave as full-history stores with tail-only refreshes, loaded into memory on app reload/startup, and suppressed crowded monthly/quarterly bar traces for long lookbacks.
 - Renamed Portfolio Analysis to Holdings Analysis and replaced the raw imported Numbers table with a filtered/enriched holdings analysis table.
 - Added a new Portfolio Analysis tab that imports the Holdings table from `Investments.numbers` and renders it in the right pane.
 - Removed the Analyze All button and now auto-analyze both modes on page load/refresh, with the first ticker selected by default.
