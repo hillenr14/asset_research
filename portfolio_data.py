@@ -20,6 +20,7 @@ PORTFOLIO_CACHE_TTL_SECONDS = 86400
 PORTFOLIO_SOURCE_COLUMNS = ["Ticker", "Type", "Loc", "Quantity", "Buy date", "Bought at"]
 CASH_PRICE = 1.0
 CASH_YIELD = 0.035
+HOLDINGS_NAVIGABLE_TYPES = {"stock", "income", "growth"}
 
 
 def _normalize_portfolio_value(value):
@@ -87,6 +88,21 @@ def portfolio_history_tickers() -> list[str]:
     return [ticker for ticker in tickers.astype(str).str.strip().str.upper().tolist() if ticker]
 
 
+def holdings_navigation_items() -> pd.DataFrame:
+    holdings = build_holdings_analysis_table()
+    if holdings.empty:
+        return pd.DataFrame(columns=["Ticker", "Type", "Description"])
+    eligible = holdings[
+        holdings["Type"].astype(str).str.strip().str.lower().isin(HOLDINGS_NAVIGABLE_TYPES)
+    ].copy()
+    if eligible.empty:
+        return pd.DataFrame(columns=["Ticker", "Type", "Description"])
+    eligible["Ticker"] = eligible["Ticker"].astype(str).str.strip().str.upper()
+    eligible["Type"] = eligible["Type"].astype(str).str.strip()
+    eligible = eligible.sort_values(["Ticker", "Description"]).drop_duplicates(subset=["Ticker"], keep="first")
+    return eligible[["Ticker", "Type", "Description"]].reset_index(drop=True)
+
+
 def _coerce_float(value):
     if value in ("", None) or pd.isna(value):
         return None
@@ -112,6 +128,16 @@ def _normalize_yield(value):
     if 0.15 <= numeric:
         return numeric / 100
     return numeric
+
+
+def _annualized_gain(price: float | None, bought_at: float | None, buy_date: date | None) -> float | None:
+    if price is None or bought_at in (None, 0) or buy_date is None or bought_at <= 0:
+        return None
+    days_held = max((date.today() - buy_date).days, 1)
+    total_return_multiple = price / bought_at
+    if total_return_multiple <= 0:
+        return None
+    return total_return_multiple ** (365.0 / days_held) - 1.0
 
 
 def _compute_reinvested_asset_value(
@@ -153,6 +179,7 @@ def build_holdings_analysis_table() -> pd.DataFrame:
 
     source["Quantity"] = source["Quantity"].map(_coerce_float)
     source["Bought at"] = source["Bought at"].map(_coerce_float)
+    source["Buy Date"] = source["Buy Date"].map(_coerce_date)
 
     descriptions = []
     prices = []
@@ -167,6 +194,7 @@ def build_holdings_analysis_table() -> pd.DataFrame:
         asset_type = str(row["Type"]).strip().lower()
         quantity = row["Quantity"] or 0.0
         bought_at = row["Bought at"] or 0.0
+        buy_date = row["Buy Date"]
 
         if asset_type == "cash":
             description = "Cash"
@@ -187,7 +215,7 @@ def build_holdings_analysis_table() -> pd.DataFrame:
                 trailing_pe = None
 
         market_value = quantity * price if price is not None else None
-        gain = ((price - bought_at) / bought_at) if price is not None and bought_at not in (None, 0) else None
+        gain = _annualized_gain(price, bought_at, buy_date)
         income = (
             dividend_yield * market_value
             if dividend_yield is not None and market_value is not None
@@ -393,10 +421,108 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
     }
 
 
+@st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
+def build_holdings_income_by_month_table() -> pd.DataFrame:
+    holdings = load_portfolio_holdings().copy()
+    if holdings.empty:
+        return pd.DataFrame(columns=["Asset", "Total (1Y)"])
+
+    holdings["Quantity"] = holdings["Quantity"].map(_coerce_float)
+    end_ts = pd.Timestamp(date.today())
+    month_periods = pd.period_range(end=end_ts.to_period("M"), periods=12, freq="M")
+    start_ts = month_periods[0].to_timestamp()
+    full_index = pd.date_range(start=start_ts, end=end_ts, freq="D")
+
+    records: list[dict[str, object]] = []
+    month_labels = [period.strftime("%b %Y") for period in month_periods]
+
+    for _, row in holdings.iterrows():
+        ticker = str(row.get("Ticker", "")).strip().upper()
+        asset_type = str(row.get("Type", "")).strip().lower()
+        quantity = row.get("Quantity") or 0.0
+        if not ticker or quantity <= 0:
+            continue
+
+        if asset_type == "cash":
+            daily_income = pd.Series(
+                quantity * CASH_PRICE * CASH_YIELD / 365.0,
+                index=full_index,
+                dtype="float64",
+            )
+        else:
+            try:
+                history = get_full_price_history(ticker)
+            except Exception:
+                continue
+            if history.empty:
+                continue
+            dividends = history["Dividends"].fillna(0.0)
+            dividends.index = pd.to_datetime(dividends.index).tz_localize(None)
+            daily_income = dividends.reindex(full_index, fill_value=0.0) * quantity
+
+        monthly_income = daily_income.groupby(daily_income.index.to_period("M")).sum().reindex(month_periods, fill_value=0.0)
+        total_income = float(monthly_income.sum())
+        if abs(total_income) < 1e-12:
+            continue
+
+        try:
+            snapshot, _, _ = get_ticker_snapshot(ticker)
+            asset_label = ticker if snapshot.short_name == ticker else f"{ticker} · {snapshot.short_name}"
+        except Exception:
+            asset_label = ticker
+
+        record: dict[str, object] = {
+            "Ticker": ticker,
+            "Type": row.get("Type"),
+            "Asset": asset_label,
+            "Total (1Y)": total_income,
+        }
+        for period, label in zip(month_periods, month_labels):
+            record[label] = float(monthly_income.loc[period])
+        records.append(record)
+
+    if not records:
+        return pd.DataFrame(columns=["Ticker", "Type", "Asset", "Total (1Y)"] + month_labels)
+
+    income_table = pd.DataFrame(records)
+    income_table = (
+        income_table.groupby(["Ticker", "Type", "Asset"], as_index=False)[["Total (1Y)", *month_labels]]
+        .sum()
+        .sort_values(["Asset", "Ticker"])
+        .reset_index(drop=True)
+    )
+    month_totals = income_table[month_labels].sum(axis=0)
+    totals_row = {"Ticker": "", "Type": "", "Asset": "Total Income", "Total (1Y)": float(month_totals.sum())}
+    totals_row.update({label: float(month_totals[label]) for label in month_labels})
+
+    month_changes = month_totals.diff()
+    changes_row = {"Ticker": "", "Type": "", "Asset": "Change vs Prev", "Total (1Y)": None}
+    changes_row.update(
+        {
+            label: (float(month_changes[label]) if pd.notna(month_changes[label]) else None)
+            for label in month_labels
+        }
+    )
+
+    return pd.concat([income_table, pd.DataFrame([totals_row, changes_row])], ignore_index=True)
+
+
 def compute_holdings_totals(holdings: pd.DataFrame) -> dict[str, float]:
+    cost_basis = (
+        pd.to_numeric(holdings["Quantity"], errors="coerce").fillna(0.0)
+        * pd.to_numeric(holdings["Bought at"], errors="coerce").fillna(0.0)
+    )
+    market_values = pd.to_numeric(holdings["Market Value"], errors="coerce").fillna(0.0)
+    total_cost_basis = float(cost_basis.sum())
+    total_gain = (
+        float((market_values.sum() - total_cost_basis) / total_cost_basis)
+        if total_cost_basis > 0
+        else 0.0
+    )
     return {
-        "market_value": float(pd.to_numeric(holdings["Market Value"], errors="coerce").fillna(0.0).sum()),
+        "market_value": float(market_values.sum()),
         "income": float(pd.to_numeric(holdings["Income"], errors="coerce").fillna(0.0).sum()),
+        "total_gain": total_gain,
     }
 
 
@@ -427,6 +553,15 @@ def _format_integer(value) -> str:
         return str(value)
 
 
+def _format_currency_integer(value) -> str:
+    if value in ("", None) or pd.isna(value):
+        return ""
+    try:
+        return f"${round(float(value)):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def format_portfolio_holdings_for_display(holdings: pd.DataFrame) -> pd.DataFrame:
     display = holdings.copy()
 
@@ -445,7 +580,17 @@ def format_portfolio_holdings_for_display(holdings: pd.DataFrame) -> pd.DataFram
     return display
 
 
+def format_income_by_month_for_display(income_table: pd.DataFrame) -> pd.DataFrame:
+    display = income_table.copy()
+    for column in display.columns:
+        if column in {"Ticker", "Type", "Asset"}:
+            continue
+        display[column] = display[column].map(_format_currency_integer)
+    return display
+
+
 def refresh_holdings_analysis_data() -> None:
     load_portfolio_holdings.clear()
     build_holdings_analysis_table.clear()
     build_holdings_portfolio_histories.clear()
+    build_holdings_income_by_month_table.clear()

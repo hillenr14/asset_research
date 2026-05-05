@@ -17,13 +17,17 @@ from config import (
 )
 from data_provider import clear_in_memory_price_history_cache, get_ticker_snapshot, warm_price_history_cache
 from portfolio_data import (
+    HOLDINGS_NAVIGABLE_TYPES,
     PORTFOLIO_DOCUMENT_PATH,
     PORTFOLIO_SHEET_NAME,
     PORTFOLIO_TABLE_NAME,
     build_holdings_analysis_table,
+    build_holdings_income_by_month_table,
     build_holdings_portfolio_histories,
     compute_holdings_totals,
+    format_income_by_month_for_display,
     format_portfolio_holdings_for_display,
+    holdings_navigation_items,
     portfolio_history_tickers,
     refresh_holdings_analysis_data,
 )
@@ -154,6 +158,10 @@ def initialize_state() -> None:
     st.session_state.setdefault("valuation_show_summary", True)
     st.session_state.setdefault("selected_lookback", DEFAULT_LOOKBACK)
     st.session_state.setdefault("selected_page", "Dividend Analysis")
+    st.session_state.setdefault("holdings_show_summary", True)
+    st.session_state.setdefault("holdings_selected_ticker", None)
+    st.session_state.setdefault("holdings_selected_type", None)
+    st.session_state.setdefault("holdings_detail_signature", None)
     st.session_state["show_export_actions"] = False
     st.session_state.setdefault("dividend_auto_signature", None)
     st.session_state.setdefault("valuation_auto_signature", None)
@@ -257,6 +265,57 @@ def get_asset_name(ticker: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def holdings_analysis_mode(asset_type: str | None) -> str | None:
+    normalized_type = str(asset_type or "").strip().lower()
+    if normalized_type == "stock":
+        return "valuation"
+    if normalized_type in {"income", "growth"}:
+        return "dividend"
+    return None
+
+
+def switch_holdings_detail(ticker: str, asset_type: str | None) -> None:
+    mode = holdings_analysis_mode(asset_type)
+    if mode is None:
+        return
+    st.session_state["holdings_selected_ticker"] = ticker
+    st.session_state["holdings_selected_type"] = asset_type
+    st.session_state["holdings_show_summary"] = False
+    analyze_single_ticker(mode, ticker)
+    st.session_state["holdings_detail_signature"] = (ticker, str(asset_type).strip().lower(), current_lookback())
+
+
+def ensure_holdings_selection() -> None:
+    nav_items = holdings_navigation_items()
+    selected_ticker = st.session_state.get("holdings_selected_ticker")
+    if nav_items.empty:
+        st.session_state["holdings_selected_ticker"] = None
+        st.session_state["holdings_selected_type"] = None
+        return
+    if selected_ticker in nav_items["Ticker"].tolist():
+        selected_row = nav_items.loc[nav_items["Ticker"] == selected_ticker].iloc[0]
+        st.session_state["holdings_selected_type"] = selected_row["Type"]
+        return
+    first_row = nav_items.iloc[0]
+    st.session_state["holdings_selected_ticker"] = first_row["Ticker"]
+    st.session_state["holdings_selected_type"] = first_row["Type"]
+
+
+def sync_holdings_detail() -> None:
+    if st.session_state.get("holdings_show_summary", True):
+        return
+    ticker = st.session_state.get("holdings_selected_ticker")
+    asset_type = st.session_state.get("holdings_selected_type")
+    mode = holdings_analysis_mode(asset_type)
+    if not ticker or mode is None:
+        return
+    signature = (ticker, str(asset_type).strip().lower(), current_lookback())
+    if st.session_state.get("holdings_detail_signature") == signature:
+        return
+    analyze_single_ticker(mode, ticker)
+    st.session_state["holdings_detail_signature"] = signature
 
 
 def prune_results_for_mode(mode: str, tickers: list[str]) -> None:
@@ -433,6 +492,83 @@ def render_asset_list(mode: str) -> None:
                 st.markdown(f'<div class="asset-name">{asset_name}</div>', unsafe_allow_html=True)
 
 
+def interactive_table_display(
+    source_df: pd.DataFrame,
+    display_df: pd.DataFrame,
+    key_prefix: str,
+    visible_rows: int = 20,
+    hidden_columns: set[str] | None = None,
+) -> None:
+    if source_df.empty or display_df.empty:
+        st.info("No data available.")
+        return
+
+    hidden_columns = hidden_columns or set()
+    visible_columns = [column for column in display_df.columns if column not in hidden_columns]
+    widths = [0.55] + [
+        1.35 if column in {"Ticker", "Asset", "Description", "Total (1Y)"} else 1.0
+        for column in visible_columns
+    ]
+
+    header = st.columns(widths)
+    with header[0]:
+        st.markdown(" ")
+    for index, column in enumerate(visible_columns, start=1):
+        with header[index]:
+            st.markdown(f"**{column}**")
+
+    rows_to_render = min(len(display_df), visible_rows)
+    for row_index in range(rows_to_render):
+        source_row = source_df.iloc[row_index]
+        display_row = display_df.iloc[row_index]
+        row_cols = st.columns(widths)
+        with row_cols[0]:
+            ticker = str(source_row.get("Ticker", "")).strip().upper()
+            asset_type = source_row.get("Type")
+            if holdings_analysis_mode(asset_type) is not None and ticker:
+                if st.button(
+                    "↗",
+                    key=f"{key_prefix}-open-{row_index}-{ticker}",
+                    width="stretch",
+                ):
+                    switch_holdings_detail(ticker, asset_type)
+                    st.rerun()
+            else:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+        for index, column in enumerate(visible_columns, start=1):
+            with row_cols[index]:
+                st.markdown(str(display_row.get(column, "")))
+
+
+def render_holdings_asset_list() -> None:
+    st.markdown('<div class="pane-title">Holdings Assets</div>', unsafe_allow_html=True)
+    st.caption(f"Lookback: {current_lookback()}")
+
+    if st.button("Summary", key="holdings-summary-button", width="stretch"):
+        st.session_state["holdings_show_summary"] = True
+        st.rerun()
+
+    st.divider()
+    nav_items = holdings_navigation_items()
+    for _, row in nav_items.iterrows():
+        ticker = str(row["Ticker"]).strip().upper()
+        asset_type = row["Type"]
+        row_cols = st.columns([1.8, 3.4])
+        with row_cols[0]:
+            if st.button(
+                ticker,
+                key=f"holdings-select-{ticker}",
+                width="stretch",
+                type="primary" if st.session_state.get("holdings_selected_ticker") == ticker and not st.session_state.get("holdings_show_summary", True) else "secondary",
+            ):
+                switch_holdings_detail(ticker, asset_type)
+                st.rerun()
+        with row_cols[1]:
+            asset_name = row.get("Description") or get_asset_name(ticker)
+            if asset_name:
+                st.markdown(f'<div class="asset-name">{asset_name}</div>', unsafe_allow_html=True)
+
+
 def render_dividend_main(result: DividendAnalysisResult | None, ticker: str | None) -> None:
     if not ticker:
         st.info("Add a ticker on the left to view dividend analysis.")
@@ -600,77 +736,144 @@ def render_analysis_summary(mode: str) -> None:
     render_summary_table(mode, summary_df)
 
 
+def render_holdings_summary() -> None:
+    st.header("Holdings Analysis")
+    st.markdown(
+        '<div class="pane-copy">Imported core holdings data from the Numbers workbook, enriched with live yfinance fields and calculated portfolio metrics.</div>',
+        unsafe_allow_html=True,
+    )
+    holdings_df = build_holdings_analysis_table()
+    totals = compute_holdings_totals(holdings_df)
+    holdings_display_df = format_portfolio_holdings_for_display(holdings_df)
+    holdings_selection = st.dataframe(
+        holdings_display_df,
+        width="stretch",
+        height=dataframe_height(len(holdings_display_df), visible_rows=20),
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="holdings-summary-table",
+    )
+    selected_rows = []
+    if holdings_selection is not None:
+        if hasattr(holdings_selection, "selection") and hasattr(holdings_selection.selection, "rows"):
+            selected_rows = list(holdings_selection.selection.rows)
+        elif isinstance(holdings_selection, dict):
+            selected_rows = list(holdings_selection.get("selection", {}).get("rows", []))
+    if selected_rows:
+        row_index = selected_rows[0]
+        source_row = holdings_df.iloc[row_index]
+        ticker = str(source_row.get("Ticker", "")).strip().upper()
+        asset_type = source_row.get("Type")
+        if holdings_analysis_mode(asset_type) is not None and ticker:
+            switch_holdings_detail(ticker, asset_type)
+            st.rerun()
+    st.markdown(
+        f'''
+        <div class="totals-row">
+            <span><strong>Total Market Value:</strong> ${totals["market_value"]:,.2f}</span>
+            <span><strong>Total Income:</strong> ${totals["income"]:,.2f}</span>
+            <span><strong>Total Gain:</strong> {totals["total_gain"] * 100:.2f}%</span>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+    income_by_month_df = build_holdings_income_by_month_table()
+    if not income_by_month_df.empty:
+        st.divider()
+        st.subheader("Income by Month")
+        income_display_df = format_income_by_month_for_display(income_by_month_df).drop(
+            columns=["Ticker", "Type"],
+            errors="ignore",
+        )
+        income_selection = st.dataframe(
+            income_display_df,
+            width="stretch",
+            height=dataframe_height(len(income_display_df), visible_rows=20),
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="holdings-income-by-month-table",
+        )
+        selected_rows = []
+        if income_selection is not None:
+            if hasattr(income_selection, "selection") and hasattr(income_selection.selection, "rows"):
+                selected_rows = list(income_selection.selection.rows)
+            elif isinstance(income_selection, dict):
+                selected_rows = list(income_selection.get("selection", {}).get("rows", []))
+        if selected_rows:
+            row_index = selected_rows[0]
+            source_row = income_by_month_df.iloc[row_index]
+            ticker = str(source_row.get("Ticker", "")).strip().upper()
+            asset_type = source_row.get("Type")
+            if holdings_analysis_mode(asset_type) is not None and ticker:
+                switch_holdings_detail(ticker, asset_type)
+                st.rerun()
+    portfolio_histories = build_holdings_portfolio_histories()
+    portfolio_value_history, monthly_income_history = portfolio_histories["actual"]
+    portfolio_value_history = slice_history_for_current_lookback(portfolio_value_history)
+    portfolio_value_history = rebase_reinvested_series_for_display(portfolio_value_history)
+    monthly_income_history = slice_history_for_current_lookback(monthly_income_history)
+    if not portfolio_value_history.empty:
+        st.divider()
+        st.subheader("Portfolio Performance")
+        st.plotly_chart(
+            build_holdings_portfolio_chart(
+                portfolio_value_history,
+                monthly_income_history,
+                title="Holdings Portfolio - Actual Held Period",
+                show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
+            ),
+            width="stretch",
+        )
+    full_year_value_history, full_year_income_history = portfolio_histories["full_year"]
+    full_year_value_history = slice_history_for_current_lookback(full_year_value_history)
+    full_year_value_history = rebase_reinvested_series_for_display(full_year_value_history)
+    full_year_income_history = slice_history_for_current_lookback(full_year_income_history)
+    if not full_year_value_history.empty:
+        st.subheader("Portfolio Performance Assuming Current Holdings Were Held All Period")
+        st.plotly_chart(
+            build_holdings_portfolio_chart(
+                full_year_value_history,
+                full_year_income_history,
+                title="Holdings Portfolio - Current Holdings Held for Full Period",
+                show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
+            ),
+            width="stretch",
+        )
+
+
 def render_portfolio_tab() -> None:
     if not st.session_state.get("holdings_refreshed_on_load", False):
         refresh_holdings_analysis_data()
         st.session_state["holdings_refreshed_on_load"] = True
 
+    ensure_holdings_selection()
+    sync_holdings_detail()
+
     left, right = st.columns([0.9, 3.4], vertical_alignment="top")
     with left:
         portfolio_pane = st.container(border=True)
         with portfolio_pane:
-            st.markdown('<div class="pane-title">Portfolio Source</div>', unsafe_allow_html=True)
-            st.caption(f"Document: {PORTFOLIO_DOCUMENT_PATH.name}")
-            st.caption(f"Sheet: {PORTFOLIO_SHEET_NAME}")
-            st.caption(f"Table: {PORTFOLIO_TABLE_NAME}")
+            render_holdings_asset_list()
     with right:
         holdings_pane = st.container(border=True)
         with holdings_pane:
-            st.header("Holdings Analysis")
-            st.markdown(
-                '<div class="pane-copy">Imported core holdings data from the Numbers workbook, enriched with live yfinance fields and calculated portfolio metrics.</div>',
-                unsafe_allow_html=True,
-            )
             try:
-                holdings_df = build_holdings_analysis_table()
-                totals = compute_holdings_totals(holdings_df)
-                st.dataframe(
-                    format_portfolio_holdings_for_display(holdings_df),
-                    width="stretch",
-                    height=dataframe_height(len(holdings_df), visible_rows=20),
-                    hide_index=True,
-                )
-                st.markdown(
-                    f'''
-                    <div class="totals-row">
-                        <span><strong>Total Market Value:</strong> ${totals["market_value"]:,.2f}</span>
-                        <span><strong>Total Income:</strong> ${totals["income"]:,.2f}</span>
-                    </div>
-                    ''',
-                    unsafe_allow_html=True,
-                )
-                portfolio_histories = build_holdings_portfolio_histories()
-                portfolio_value_history, monthly_income_history = portfolio_histories["actual"]
-                portfolio_value_history = slice_history_for_current_lookback(portfolio_value_history)
-                portfolio_value_history = rebase_reinvested_series_for_display(portfolio_value_history)
-                monthly_income_history = slice_history_for_current_lookback(monthly_income_history)
-                if not portfolio_value_history.empty:
-                    st.divider()
-                    st.subheader("Portfolio Performance")
-                    st.plotly_chart(
-                        build_holdings_portfolio_chart(
-                            portfolio_value_history,
-                            monthly_income_history,
-                            title="Holdings Portfolio - Actual Held Period",
-                            show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
-                        ),
-                        width="stretch",
-                    )
-                full_year_value_history, full_year_income_history = portfolio_histories["full_year"]
-                full_year_value_history = slice_history_for_current_lookback(full_year_value_history)
-                full_year_value_history = rebase_reinvested_series_for_display(full_year_value_history)
-                full_year_income_history = slice_history_for_current_lookback(full_year_income_history)
-                if not full_year_value_history.empty:
-                    st.subheader("Portfolio Performance Assuming Current Holdings Were Held All Period")
-                    st.plotly_chart(
-                        build_holdings_portfolio_chart(
-                            full_year_value_history,
-                            full_year_income_history,
-                            title="Holdings Portfolio - Current Holdings Held for Full Period",
-                            show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
-                        ),
-                        width="stretch",
-                    )
+                if st.session_state.get("holdings_show_summary", True):
+                    render_holdings_summary()
+                else:
+                    ticker = st.session_state.get("holdings_selected_ticker")
+                    asset_type = st.session_state.get("holdings_selected_type")
+                    mode = holdings_analysis_mode(asset_type)
+                    if mode == "dividend":
+                        result = st.session_state["dividend_results"].get(ticker) if ticker else None
+                        render_dividend_main(result, ticker)
+                    elif mode == "valuation":
+                        result = st.session_state["valuation_results"].get(ticker) if ticker else None
+                        render_valuation_main(result, ticker)
+                    else:
+                        render_holdings_summary()
             except Exception as exc:
                 st.error(str(exc))
 

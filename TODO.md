@@ -2,6 +2,9 @@
 
 ## NEW
 
+- New feature: add portfolio analysis with back test
+  - Add new tab for portfolio analysis 
+
 ## Completed
 
 - Added a global lookback control (`1w`, `1m`, `3m`, `6m`, `1y`, `2y`, `5y`, `10y`, `all`) above the tabs and updated the app to slice all analysis views from full cached histories in memory.
