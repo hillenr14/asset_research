@@ -422,6 +422,127 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
 
 
 @st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
+def build_holdings_portfolio_window(
+    start_date: date,
+    end_date: date,
+    assume_full_period: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    holdings = load_portfolio_holdings().copy()
+    if holdings.empty:
+        return (
+            pd.DataFrame(columns=["Portfolio Value", "Reinvested Portfolio Value"]),
+            pd.DataFrame(columns=["Income"]),
+        )
+
+    holdings["Quantity"] = holdings["Quantity"].map(_coerce_float)
+    holdings["Buy Date"] = holdings["Buy Date"].map(_coerce_date)
+
+    history_starts: list[date] = []
+    non_cash_histories: dict[str, pd.DataFrame] = {}
+    for _, row in holdings.iterrows():
+        ticker = str(row.get("Ticker", "")).strip().upper()
+        asset_type = str(row.get("Type", "")).strip().lower()
+        buy_date = row.get("Buy Date")
+
+        if asset_type == "cash":
+            history_starts.append(buy_date or start_date)
+            continue
+        if not ticker:
+            continue
+        try:
+            history = get_full_price_history(ticker)
+        except Exception:
+            continue
+        if history.empty:
+            continue
+        non_cash_histories[ticker] = history
+        history_starts.append(history.index.min().date())
+        if buy_date:
+            history_starts.append(buy_date)
+
+    if not history_starts:
+        return (
+            pd.DataFrame(columns=["Portfolio Value", "Reinvested Portfolio Value"]),
+            pd.DataFrame(columns=["Income"]),
+        )
+
+    effective_start = max(start_date, min(history_starts))
+    if effective_start > end_date:
+        return (
+            pd.DataFrame(columns=["Portfolio Value", "Reinvested Portfolio Value"]),
+            pd.DataFrame(columns=["Income"]),
+        )
+
+    full_index = pd.date_range(start=effective_start, end=end_date, freq="D")
+    total_value = pd.Series(0.0, index=full_index, dtype="float64")
+    total_income = pd.Series(0.0, index=full_index, dtype="float64")
+    total_reinvested_value = pd.Series(0.0, index=full_index, dtype="float64")
+
+    for _, row in holdings.iterrows():
+        ticker = str(row.get("Ticker", "")).strip().upper()
+        asset_type = str(row.get("Type", "")).strip().lower()
+        quantity = row.get("Quantity") or 0.0
+        buy_date = row.get("Buy Date")
+
+        if not ticker or quantity <= 0:
+            continue
+
+        active_start = effective_start if assume_full_period else max(effective_start, buy_date) if buy_date else effective_start
+        if active_start > end_date:
+            continue
+
+        asset_index = pd.date_range(start=active_start, end=end_date, freq="D")
+
+        if asset_type == "cash":
+            asset_value = pd.Series(quantity * CASH_PRICE, index=asset_index, dtype="float64")
+            asset_income = pd.Series(
+                quantity * CASH_PRICE * CASH_YIELD / 365.0,
+                index=asset_index,
+                dtype="float64",
+            )
+            asset_reinvested_value = _compute_reinvested_cash_value(asset_index, quantity * CASH_PRICE)
+        else:
+            history = non_cash_histories.get(ticker)
+            if history is None or history.empty:
+                continue
+            close_series = history["Close"].dropna()
+            if close_series.empty:
+                continue
+            close_series.index = pd.to_datetime(close_series.index).tz_localize(None)
+            dividends = history["Dividends"].fillna(0.0)
+            dividends.index = pd.to_datetime(dividends.index).tz_localize(None)
+
+            aligned_close = close_series.reindex(asset_index).ffill().bfill()
+            aligned_dividends = dividends.reindex(asset_index, fill_value=0.0)
+            asset_value = aligned_close * quantity
+            asset_income = aligned_dividends * quantity
+            asset_reinvested_value = _compute_reinvested_asset_value(
+                aligned_close,
+                aligned_dividends,
+                quantity,
+            )
+
+        total_value.loc[asset_index] = total_value.loc[asset_index].add(asset_value, fill_value=0.0)
+        total_income.loc[asset_index] = total_income.loc[asset_index].add(asset_income, fill_value=0.0)
+        total_reinvested_value.loc[asset_index] = total_reinvested_value.loc[asset_index].add(
+            asset_reinvested_value,
+            fill_value=0.0,
+        )
+
+    monthly_income = total_income.resample("ME").sum()
+    monthly_income = monthly_income.loc[monthly_income.index <= pd.Timestamp(end_date)]
+    return (
+        pd.DataFrame(
+            {
+                "Portfolio Value": total_value,
+                "Reinvested Portfolio Value": total_reinvested_value,
+            }
+        ),
+        pd.DataFrame({"Income": monthly_income}),
+    )
+
+
+@st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
 def build_holdings_income_by_month_table() -> pd.DataFrame:
     holdings = load_portfolio_holdings().copy()
     if holdings.empty:

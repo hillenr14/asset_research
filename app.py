@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -15,7 +17,7 @@ from config import (
     rolling_analysis_start_date,
     save_config,
 )
-from data_provider import clear_in_memory_price_history_cache, get_ticker_snapshot, warm_price_history_cache
+from data_provider import clear_in_memory_price_history_cache, get_full_price_history, get_ticker_snapshot, warm_price_history_cache
 from portfolio_data import (
     HOLDINGS_NAVIGABLE_TYPES,
     PORTFOLIO_DOCUMENT_PATH,
@@ -24,6 +26,7 @@ from portfolio_data import (
     build_holdings_analysis_table,
     build_holdings_income_by_month_table,
     build_holdings_portfolio_histories,
+    build_holdings_portfolio_window,
     compute_holdings_totals,
     format_income_by_month_for_display,
     format_portfolio_holdings_for_display,
@@ -241,10 +244,179 @@ def rebase_reinvested_series_for_display(history: pd.DataFrame) -> pd.DataFrame:
     rebased = history.copy()
     start_value = rebased["Portfolio Value"].iloc[0]
     reinvested_start = rebased["Reinvested Portfolio Value"].iloc[0]
+    if pd.isna(start_value) or pd.isna(reinvested_start) or reinvested_start in (None, 0):
+        return rebased
+    scale_factor = start_value / reinvested_start
     rebased["Reinvested Portfolio Value"] = (
-        rebased["Reinvested Portfolio Value"] - reinvested_start + start_value
+        rebased["Reinvested Portfolio Value"] * scale_factor
     )
     return rebased
+
+
+def build_rebased_benchmark_series(
+    benchmark_ticker: str,
+    reference_history: pd.DataFrame,
+) -> pd.Series | None:
+    if reference_history.empty or "Portfolio Value" not in reference_history.columns:
+        return None
+    try:
+        benchmark_history = get_full_price_history(benchmark_ticker)
+    except Exception:
+        return None
+    if benchmark_history.empty or "Adj Close" not in benchmark_history.columns:
+        return None
+
+    benchmark_series = benchmark_history["Adj Close"].dropna()
+    if benchmark_series.empty:
+        return None
+    benchmark_series.index = pd.to_datetime(benchmark_series.index).tz_localize(None)
+    rebased_index = pd.DatetimeIndex(reference_history.index)
+    benchmark_series = benchmark_series.reindex(rebased_index).ffill().bfill()
+    if benchmark_series.empty or pd.isna(benchmark_series.iloc[0]) or benchmark_series.iloc[0] == 0:
+        return None
+
+    start_value = reference_history["Portfolio Value"].iloc[0]
+    return (benchmark_series / benchmark_series.iloc[0]) * start_value
+
+
+def _annualized_return_from_values(start_value: float, end_value: float, num_days: int) -> float | None:
+    if start_value <= 0 or end_value <= 0 or num_days <= 0:
+        return None
+    return (end_value / start_value) ** (365.0 / num_days) - 1.0
+
+
+def _annualized_income_return(income_total: float, start_value: float, num_days: int) -> float | None:
+    if start_value <= 0 or num_days <= 0:
+        return None
+    return (income_total / start_value) * (365.0 / num_days)
+
+
+def _compute_alpha_beta_vs_spy(
+    portfolio_series: pd.Series,
+    benchmark_series: pd.Series,
+) -> tuple[float | None, float | None]:
+    portfolio_returns = portfolio_series.pct_change()
+    benchmark_returns = benchmark_series.pct_change()
+    aligned = pd.concat(
+        [portfolio_returns.rename("portfolio"), benchmark_returns.rename("benchmark")],
+        axis=1,
+    ).dropna()
+    if len(aligned) < 2:
+        return None, None
+    benchmark_variance = aligned["benchmark"].var()
+    if benchmark_variance in (None, 0) or pd.isna(benchmark_variance):
+        return None, None
+    beta = aligned["portfolio"].cov(aligned["benchmark"]) / benchmark_variance
+    alpha_daily = aligned["portfolio"].mean() - beta * aligned["benchmark"].mean()
+    alpha_annual = alpha_daily * 252
+    return float(alpha_annual), float(beta)
+
+
+def build_holdings_window_metrics_table(
+    portfolio_value_history: pd.DataFrame,
+    monthly_income_history: pd.DataFrame,
+) -> pd.DataFrame:
+    if portfolio_value_history.empty or monthly_income_history.empty:
+        return pd.DataFrame()
+
+    window_specs = [
+        ("1wk", pd.DateOffset(weeks=1)),
+        ("1m", pd.DateOffset(months=1)),
+        ("3m", pd.DateOffset(months=3)),
+        ("6m", pd.DateOffset(months=6)),
+        ("1y", pd.DateOffset(years=1)),
+        ("2y", pd.DateOffset(years=2)),
+        ("5y", pd.DateOffset(years=5)),
+    ]
+    benchmark_history = get_full_price_history(BENCHMARK_TICKER)
+    benchmark_adj_close = benchmark_history["Adj Close"].dropna() if not benchmark_history.empty and "Adj Close" in benchmark_history.columns else pd.Series(dtype="float64")
+    if not benchmark_adj_close.empty:
+        benchmark_adj_close.index = pd.to_datetime(benchmark_adj_close.index).tz_localize(None)
+
+    end_ts = pd.Timestamp(portfolio_value_history.index.max())
+    columns: dict[str, dict[str, float | None]] = {}
+
+    for label, offset in window_specs:
+        start_ts = end_ts - offset
+        window_values = portfolio_value_history.loc[portfolio_value_history.index >= start_ts].copy()
+        window_income = monthly_income_history.loc[monthly_income_history.index >= start_ts].copy()
+        if window_values.empty or len(window_values.index) < 2:
+            columns[label] = {metric: None for metric in [
+                "Returns (annualized)",
+                "Income (annualized)",
+                "Total return (annualized)",
+                "Volatility (annualized)",
+                "Sharpe Ratio",
+                "Beta (vs SPY)",
+                "Alpha (vs SPY)",
+            ]}
+            continue
+
+        window_days = max((pd.Timestamp(window_values.index.max()) - pd.Timestamp(window_values.index.min())).days, 1)
+        start_value = float(window_values["Portfolio Value"].iloc[0])
+        end_value = float(window_values["Portfolio Value"].iloc[-1])
+        start_reinvested = float(window_values["Reinvested Portfolio Value"].iloc[0])
+        end_reinvested = float(window_values["Reinvested Portfolio Value"].iloc[-1])
+        income_total = float(window_income["Income"].sum()) if "Income" in window_income.columns else 0.0
+
+        reinvested_returns = window_values["Reinvested Portfolio Value"].pct_change().dropna()
+        volatility = float(reinvested_returns.std() * np.sqrt(252)) if len(reinvested_returns) >= 2 else None
+        total_return = _annualized_return_from_values(start_reinvested, end_reinvested, window_days)
+        sharpe_ratio = ((total_return - 0.03) / volatility) if total_return is not None and volatility not in (None, 0) else None
+
+        benchmark_slice = pd.Series(dtype="float64")
+        if not benchmark_adj_close.empty:
+            benchmark_slice = benchmark_adj_close.reindex(pd.DatetimeIndex(window_values.index)).ffill().bfill()
+        alpha, beta = (None, None)
+        if not benchmark_slice.empty:
+            alpha, beta = _compute_alpha_beta_vs_spy(window_values["Reinvested Portfolio Value"], benchmark_slice)
+
+        columns[label] = {
+            "Returns (annualized)": _annualized_return_from_values(start_value, end_value, window_days),
+            "Income (annualized)": _annualized_income_return(income_total, start_value, window_days),
+            "Total return (annualized)": total_return,
+            "Volatility (annualized)": volatility,
+            "Sharpe Ratio": sharpe_ratio,
+            "Beta (vs SPY)": beta,
+            "Alpha (vs SPY)": alpha,
+        }
+
+    metric_order = [
+        "Returns (annualized)",
+        "Income (annualized)",
+        "Total return (annualized)",
+        "Volatility (annualized)",
+        "Sharpe Ratio",
+        "Beta (vs SPY)",
+        "Alpha (vs SPY)",
+    ]
+    return pd.DataFrame(columns).reindex(metric_order)
+
+
+def format_holdings_window_metrics_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if metrics_df.empty:
+        return metrics_df
+    display_df = metrics_df.copy().astype("object")
+    percent_rows = {
+        "Returns (annualized)",
+        "Income (annualized)",
+        "Total return (annualized)",
+        "Volatility (annualized)",
+        "Alpha (vs SPY)",
+    }
+    decimal_rows = {"Sharpe Ratio", "Beta (vs SPY)"}
+    for row_label in display_df.index:
+        for column in display_df.columns:
+            value = display_df.at[row_label, column]
+            if value is None or pd.isna(value):
+                display_df.at[row_label, column] = "N/A"
+            elif row_label in percent_rows:
+                display_df.at[row_label, column] = f"{float(value) * 100:.2f}%"
+            elif row_label in decimal_rows:
+                display_df.at[row_label, column] = f"{float(value):.2f}"
+            else:
+                display_df.at[row_label, column] = str(value)
+    return display_df.reset_index().rename(columns={"index": "Metric"})
 
 
 def get_asset_label(ticker: str) -> str:
@@ -809,11 +981,13 @@ def render_holdings_summary() -> None:
             if holdings_analysis_mode(asset_type) is not None and ticker:
                 switch_holdings_detail(ticker, asset_type)
                 st.rerun()
-    portfolio_histories = build_holdings_portfolio_histories()
-    portfolio_value_history, monthly_income_history = portfolio_histories["actual"]
-    portfolio_value_history = slice_history_for_current_lookback(portfolio_value_history)
-    portfolio_value_history = rebase_reinvested_series_for_display(portfolio_value_history)
-    monthly_income_history = slice_history_for_current_lookback(monthly_income_history)
+    window_start = analysis_start_date()
+    window_end = pd.Timestamp(date.today()).date()
+    portfolio_value_history, monthly_income_history = build_holdings_portfolio_window(
+        window_start,
+        window_end,
+        assume_full_period=False,
+    )
     if not portfolio_value_history.empty:
         st.divider()
         st.subheader("Portfolio Performance")
@@ -826,11 +1000,13 @@ def render_holdings_summary() -> None:
             ),
             width="stretch",
         )
-    full_year_value_history, full_year_income_history = portfolio_histories["full_year"]
-    full_year_value_history = slice_history_for_current_lookback(full_year_value_history)
-    full_year_value_history = rebase_reinvested_series_for_display(full_year_value_history)
-    full_year_income_history = slice_history_for_current_lookback(full_year_income_history)
+    full_year_value_history, full_year_income_history = build_holdings_portfolio_window(
+        window_start,
+        window_end,
+        assume_full_period=True,
+    )
     if not full_year_value_history.empty:
+        spy_benchmark_series = build_rebased_benchmark_series(BENCHMARK_TICKER, full_year_value_history)
         st.subheader("Portfolio Performance Assuming Current Holdings Were Held All Period")
         st.plotly_chart(
             build_holdings_portfolio_chart(
@@ -838,9 +1014,31 @@ def render_holdings_summary() -> None:
                 full_year_income_history,
                 title="Holdings Portfolio - Current Holdings Held for Full Period",
                 show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
+                benchmark_history=spy_benchmark_series,
             ),
             width="stretch",
         )
+        metrics_df = build_holdings_window_metrics_table(
+            build_holdings_portfolio_histories()["full_year"][0],
+            build_holdings_portfolio_histories()["full_year"][1],
+        )
+        if not metrics_df.empty:
+            metrics_display_df = format_holdings_window_metrics_table(metrics_df)
+            metrics_column_config = {
+                "Metric": st.column_config.TextColumn("Metric", width="medium"),
+            }
+            for column in metrics_display_df.columns:
+                if column == "Metric":
+                    continue
+                metrics_column_config[column] = st.column_config.TextColumn(column, width="small")
+            st.subheader("Portfolio Metrics by Window")
+            st.dataframe(
+                metrics_display_df,
+                width="stretch",
+                height=dataframe_height(len(metrics_df.reset_index()), visible_rows=10),
+                hide_index=True,
+                column_config=metrics_column_config,
+            )
 
 
 def render_portfolio_tab() -> None:

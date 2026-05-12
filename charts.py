@@ -351,6 +351,7 @@ def build_holdings_portfolio_chart(
     monthly_income_history: pd.DataFrame,
     title: str = "Holdings Portfolio - Total Value and Monthly Income",
     show_income_bars: bool = True,
+    benchmark_history: pd.Series | None = None,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     bar_width_ms = _bar_width_ms(portfolio_value_history.index)
@@ -374,6 +375,18 @@ def build_holdings_portfolio_chart(
                 mode="lines",
                 line=dict(color="#f472b6", width=2),
                 hovertemplate="Reinvested Value=$%{y:,.2f}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+    if benchmark_history is not None and not benchmark_history.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=benchmark_history.index,
+                y=benchmark_history.values,
+                name="SPY Adj Close (rebased)",
+                mode="lines",
+                line=dict(color="#fbbf24", width=2),
+                hovertemplate="SPY Rebased=$%{y:,.2f}<extra></extra>",
             ),
             secondary_y=False,
         )
