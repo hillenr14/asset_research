@@ -8,6 +8,8 @@ from models import TickerSnapshot
 
 TARGET_BAR_WIDTH_PX = 6
 ESTIMATED_PLOT_WIDTH_PX = 950
+VALUATION_TARGET_BAR_WIDTH_PX = 16
+VALUATION_TARGET_BAR_CENTER_SPACING_PX = 18
 
 
 def _bar_width_ms(reference_index: pd.Index) -> float:
@@ -17,6 +19,19 @@ def _bar_width_ms(reference_index: pd.Index) -> float:
     end = pd.Timestamp(reference_index.max())
     span_ms = max((end - start).total_seconds() * 1000, 24 * 60 * 60 * 1000)
     return max(span_ms * TARGET_BAR_WIDTH_PX / ESTIMATED_PLOT_WIDTH_PX, 1.0)
+
+
+def _px_to_ms(reference_index: pd.Index, pixels: float) -> float:
+    if len(reference_index) < 2:
+        return max(pixels, 1.0) * 24 * 60 * 60 * 1000
+    start = pd.Timestamp(reference_index.min())
+    end = pd.Timestamp(reference_index.max())
+    span_ms = max((end - start).total_seconds() * 1000, 24 * 60 * 60 * 1000)
+    return max(span_ms * pixels / ESTIMATED_PLOT_WIDTH_PX, 1.0)
+
+
+def _offset_datetimes_ms(index: pd.Index, offset_ms: float) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(pd.to_datetime(index) + pd.to_timedelta(offset_ms, unit="ms"))
 
 
 def _apply_plotly_layout(
@@ -194,7 +209,8 @@ def build_valuation_chart(
     show_quarterly_bars: bool = True,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    bar_width_ms = _bar_width_ms(price_plot.index)
+    bar_width_ms = _px_to_ms(price_plot.index, VALUATION_TARGET_BAR_WIDTH_PX)
+    bar_center_spacing_ms = _px_to_ms(price_plot.index, VALUATION_TARGET_BAR_CENTER_SPACING_PX)
     fig.add_trace(
         go.Scatter(
             x=pe_plot.index,
@@ -220,7 +236,7 @@ def build_valuation_chart(
     if show_quarterly_bars and eps_pct_plot is not None and not eps_pct_plot.empty:
         fig.add_trace(
             go.Bar(
-                x=eps_pct_plot.index,
+                x=_offset_datetimes_ms(eps_pct_plot.index, -bar_center_spacing_ms),
                 y=eps_pct_plot.values,
                 name="EPS / Price",
                 yaxis="y3",
@@ -237,7 +253,7 @@ def build_valuation_chart(
     if show_quarterly_bars and revenue_pct_plot is not None and not revenue_pct_plot.empty:
         fig.add_trace(
             go.Bar(
-                x=revenue_pct_plot.index,
+                x=_offset_datetimes_ms(revenue_pct_plot.index, 0),
                 y=revenue_pct_plot.values,
                 name="Rev/Share / Price",
                 yaxis="y3",
@@ -254,7 +270,7 @@ def build_valuation_chart(
     if show_quarterly_bars and free_cash_flow_pct_plot is not None and not free_cash_flow_pct_plot.empty:
         fig.add_trace(
             go.Bar(
-                x=free_cash_flow_pct_plot.index,
+                x=_offset_datetimes_ms(free_cash_flow_pct_plot.index, bar_center_spacing_ms),
                 y=free_cash_flow_pct_plot.values,
                 name="FCF / Price",
                 yaxis="y3",
@@ -284,7 +300,7 @@ def build_valuation_chart(
             ticksuffix="%",
         ),
     )
-    fig.update_layout(barmode="group", bargap=0.056, bargroupgap=0.014)
+    fig.update_layout(barmode="overlay", bargap=0, bargroupgap=0)
     return fig
 
 

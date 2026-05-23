@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from numbers_parser import Document
 
-from data_provider import get_full_price_history, get_ticker_snapshot
+from data_provider import NYSE_CALENDAR, get_full_price_history, get_ticker_snapshot
 from errors import MissingDataError, ProviderError
 
 
@@ -166,11 +166,22 @@ def _compute_reinvested_cash_value(index: pd.DatetimeIndex, principal: float) ->
     current_value = principal
     daily_rate = CASH_YIELD / 365.0
 
-    for _ in index:
+    previous_timestamp: pd.Timestamp | None = None
+    for timestamp in index:
         values.append(current_value)
-        current_value *= 1.0 + daily_rate
+        if previous_timestamp is None:
+            days_elapsed = 1
+        else:
+            days_elapsed = max((pd.Timestamp(timestamp) - pd.Timestamp(previous_timestamp)).days, 1)
+        current_value *= (1.0 + daily_rate) ** days_elapsed
+        previous_timestamp = pd.Timestamp(timestamp)
 
     return pd.Series(values, index=index, dtype="float64")
+
+
+def _session_index(start_date: date, end_date: date) -> pd.DatetimeIndex:
+    sessions = NYSE_CALENDAR.sessions_in_range(pd.Timestamp(start_date), pd.Timestamp(end_date))
+    return pd.DatetimeIndex(pd.to_datetime(sessions).tz_localize(None))
 
 
 @st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
@@ -304,7 +315,7 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
         }
 
     start_date = min(history_starts)
-    full_index = pd.date_range(start=start_date, end=end_date, freq="D")
+    full_index = _session_index(start_date, end_date)
     actual_total_value = pd.Series(0.0, index=full_index, dtype="float64")
     actual_total_income = pd.Series(0.0, index=full_index, dtype="float64")
     actual_total_reinvested_value = pd.Series(0.0, index=full_index, dtype="float64")
@@ -365,7 +376,7 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
         actual_reinvested_value.loc[actual_reinvested_value.index < pd.Timestamp(actual_start)] = 0.0
 
         if actual_start > start_date:
-            actual_index = pd.date_range(start=actual_start, end=end_date, freq="D")
+            actual_index = _session_index(actual_start, end_date)
             if asset_type == "cash":
                 actual_reinvested_slice = _compute_reinvested_cash_value(
                     actual_index,
@@ -473,7 +484,7 @@ def build_holdings_portfolio_window(
             pd.DataFrame(columns=["Income"]),
         )
 
-    full_index = pd.date_range(start=effective_start, end=end_date, freq="D")
+    full_index = _session_index(effective_start, end_date)
     total_value = pd.Series(0.0, index=full_index, dtype="float64")
     total_income = pd.Series(0.0, index=full_index, dtype="float64")
     total_reinvested_value = pd.Series(0.0, index=full_index, dtype="float64")
@@ -491,7 +502,7 @@ def build_holdings_portfolio_window(
         if active_start > end_date:
             continue
 
-        asset_index = pd.date_range(start=active_start, end=end_date, freq="D")
+        asset_index = _session_index(active_start, end_date)
 
         if asset_type == "cash":
             asset_value = pd.Series(quantity * CASH_PRICE, index=asset_index, dtype="float64")
