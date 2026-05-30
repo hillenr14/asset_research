@@ -5,6 +5,7 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from charts import build_holdings_portfolio_chart
@@ -234,8 +235,46 @@ def dataframe_height(row_count: int, visible_rows: int | None = None) -> int:
 
 
 def fundamentals_table_display(detail_df: pd.DataFrame) -> pd.DataFrame:
-    display_df = format_dataframe_for_display(detail_df).reset_index()
-    return display_df.rename(columns={"index": "Metric"})
+    currency_metrics = {"Price", "EPS", "Bought At", "Market Value", "Income"}
+    percent_metrics = {
+        "Dividend Yield (%)",
+        "Gain (%)",
+        "Annual Return (%)",
+        "Annual Return Adj (%)",
+        "Annual Volatility (%)",
+        "Alpha vs SPY (%)",
+        "Return 1D (%)",
+        "Return 1W (%)",
+        "Return 1M (%)",
+        "Return 3M (%)",
+        "Return 6M (%)",
+        "Return 1Y (%)",
+        "Return 2Y (%)",
+        "Return 5Y (%)",
+        "Return 10Y (%)",
+    }
+    integer_metrics = {"Quantity"}
+    date_metrics = {"Buy Date"}
+
+    display_df = detail_df.copy().astype("object")
+    for metric in display_df.index:
+        for column in display_df.columns:
+            value = display_df.at[metric, column]
+            if value is None or pd.isna(value):
+                display_df.at[metric, column] = "N/A"
+            elif metric in currency_metrics:
+                display_df.at[metric, column] = f"${float(value):,.2f}"
+            elif metric in percent_metrics:
+                display_df.at[metric, column] = f"{float(value):.2f}%"
+            elif metric in integer_metrics:
+                display_df.at[metric, column] = f"{round(float(value)):,}"
+            elif metric in date_metrics and hasattr(value, "isoformat"):
+                display_df.at[metric, column] = value.isoformat()
+            elif isinstance(value, float):
+                display_df.at[metric, column] = f"{value:.2f}"
+            else:
+                display_df.at[metric, column] = str(value)
+    return display_df.reset_index().rename(columns={"index": "Metric"})
 
 
 def rebase_reinvested_series_for_display(history: pd.DataFrame) -> pd.DataFrame:
@@ -741,7 +780,12 @@ def render_holdings_asset_list() -> None:
                 st.markdown(f'<div class="asset-name">{asset_name}</div>', unsafe_allow_html=True)
 
 
-def render_dividend_main(result: DividendAnalysisResult | None, ticker: str | None) -> None:
+def render_dividend_main(
+    result: DividendAnalysisResult | None,
+    ticker: str | None,
+    *,
+    include_holdings_context: bool = False,
+) -> None:
     if not ticker:
         st.info("Add a ticker on the left to view dividend analysis.")
         return
@@ -762,7 +806,11 @@ def render_dividend_main(result: DividendAnalysisResult | None, ticker: str | No
         return
 
     st.markdown('<div class="pane-copy">Selected asset output appears here after you click a ticker in the left pane.</div>', unsafe_allow_html=True)
-    detail_df = fundamentals_to_frame([result.fundamentals])
+    detail_df = fundamentals_to_frame(
+        [result.fundamentals],
+        include_holdings=include_holdings_context,
+        include_return_windows=include_holdings_context,
+    )
     display_df = fundamentals_table_display(detail_df)
     left, right = st.columns([0.9, 2.8], vertical_alignment="top")
     with left:
@@ -782,15 +830,33 @@ def render_dividend_main(result: DividendAnalysisResult | None, ticker: str | No
             csv_data=dataframe_to_csv_bytes(detail_df),
         )
     with right:
-        st.plotly_chart(result.figure, width="stretch")
+        chart_figure = go.Figure(result.figure)
+        has_benchmark_trace = any(trace.name == "SPY Adj Close (rebased)" for trace in chart_figure.data)
+        if has_benchmark_trace:
+            benchmark_enabled = st.checkbox(
+                "Benchmark",
+                value=True,
+                key=f"{ticker}-dividend-benchmark-visible",
+            )
+            chart_figure.for_each_trace(
+                lambda trace: trace.update(visible=benchmark_enabled)
+                if trace.name == "SPY Adj Close (rebased)"
+                else None
+            )
+        st.plotly_chart(chart_figure, width="stretch")
         render_export_controls(
             label_prefix=f"{ticker}-dividend-chart",
             html_name=f"{ticker.lower()}_dividend_chart.html",
-            html_data=figure_to_html(result.figure),
+            html_data=figure_to_html(chart_figure),
         )
 
 
-def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | None) -> None:
+def render_valuation_main(
+    result: ValuationAnalysisResult | None,
+    ticker: str | None,
+    *,
+    include_holdings_context: bool = False,
+) -> None:
     if not ticker:
         st.info("Add a ticker on the left to view valuation analysis.")
         return
@@ -810,7 +876,12 @@ def render_valuation_main(result: ValuationAnalysisResult | None, ticker: str | 
     left, right = st.columns([0.9, 2.8], vertical_alignment="top")
     with left:
         if result.fundamentals is not None:
-            fundamentals_df = fundamentals_to_frame([result.fundamentals], include_eps=True)
+            fundamentals_df = fundamentals_to_frame(
+                [result.fundamentals],
+                include_eps=True,
+                include_holdings=include_holdings_context,
+                include_return_windows=include_holdings_context,
+            )
             display_df = fundamentals_table_display(fundamentals_df)
             st.dataframe(
                 display_df,
@@ -1066,10 +1137,10 @@ def render_portfolio_tab() -> None:
                     mode = holdings_analysis_mode(asset_type)
                     if mode == "dividend":
                         result = st.session_state["dividend_results"].get(ticker) if ticker else None
-                        render_dividend_main(result, ticker)
+                        render_dividend_main(result, ticker, include_holdings_context=True)
                     elif mode == "valuation":
                         result = st.session_state["valuation_results"].get(ticker) if ticker else None
-                        render_valuation_main(result, ticker)
+                        render_valuation_main(result, ticker, include_holdings_context=True)
                     else:
                         render_holdings_summary()
             except Exception as exc:

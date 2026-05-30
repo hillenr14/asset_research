@@ -9,9 +9,21 @@ from charts import build_dividend_chart, build_valuation_chart
 from data_provider import get_daily_close_history, get_full_price_history, get_price_history, get_ticker_snapshot
 from errors import MissingDataError, UnsupportedAnalysisError, to_issue
 from models import DividendAnalysisResult, Fundamentals, TickerSnapshot, ValuationAnalysisResult
+from portfolio_data import build_holdings_ticker_details
 
 
 BENCHMARK_TICKER = "SPY"
+RETURN_WINDOW_OFFSETS = [
+    ("return_1d_pct", pd.DateOffset(days=1), False),
+    ("return_1w_pct", pd.DateOffset(weeks=1), False),
+    ("return_1m_pct", pd.DateOffset(months=1), False),
+    ("return_3m_pct", pd.DateOffset(months=3), False),
+    ("return_6m_pct", pd.DateOffset(months=6), False),
+    ("return_1y_pct", pd.DateOffset(years=1), True),
+    ("return_2y_pct", pd.DateOffset(years=2), True),
+    ("return_5y_pct", pd.DateOffset(years=5), True),
+    ("return_10y_pct", pd.DateOffset(years=10), True),
+]
 
 
 def _safe_float(value: float | int | None) -> float | None:
@@ -53,7 +65,70 @@ def _should_show_dividend_bars(dividends_to_plot: pd.DataFrame, history: pd.Data
     return pd.isna(median_spacing_days) or median_spacing_days > 45
 
 
-def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) -> Fundamentals:
+def _holding_detail_for_ticker(ticker: str) -> dict[str, object] | None:
+    try:
+        holdings = build_holdings_ticker_details()
+    except Exception:
+        return None
+    if holdings.empty:
+        return None
+    matches = holdings[holdings["Ticker"].astype(str).str.upper() == ticker.strip().upper()]
+    if matches.empty:
+        return None
+    row = matches.iloc[0]
+    return {
+        "quantity": _safe_float(row.get("Quantity")),
+        "buy_date": row.get("Buy Date"),
+        "bought_at": _safe_float(row.get("Bought at")),
+        "market_value": _safe_float(row.get("Market Value")),
+        "gain": _safe_float(row.get("Gain")),
+        "income": _safe_float(row.get("Income")),
+    }
+
+
+def _compute_return_windows(history: pd.DataFrame | None) -> dict[str, float | None]:
+    returns = {field_name: None for field_name, _, _ in RETURN_WINDOW_OFFSETS}
+    if history is None or history.empty:
+        return returns
+
+    price_column = "Adj Close" if "Adj Close" in history.columns else "Close" if "Close" in history.columns else None
+    if price_column is None:
+        return returns
+
+    price_series = history[price_column].dropna().copy()
+    if len(price_series.index) < 2:
+        return returns
+
+    price_series.index = pd.to_datetime(price_series.index).tz_localize(None)
+    end_ts = pd.Timestamp(price_series.index.max())
+    end_value = _safe_float(price_series.iloc[-1])
+    if end_value in (None, 0):
+        return returns
+
+    for field_name, offset, annualize in RETURN_WINDOW_OFFSETS:
+        start_ts = end_ts - offset
+        window = price_series.loc[price_series.index >= start_ts]
+        if len(window.index) < 2:
+            continue
+        start_value = _safe_float(window.iloc[0])
+        if start_value in (None, 0):
+            continue
+        period_return = (end_value / start_value) - 1.0
+        if annualize:
+            window_days = max((pd.Timestamp(window.index.max()) - pd.Timestamp(window.index.min())).days, 1)
+            period_return = (end_value / start_value) ** (365.0 / window_days) - 1.0
+        returns[field_name] = period_return * 100.0
+
+    return returns
+
+
+def _build_fundamentals(
+    snapshot: TickerSnapshot,
+    history: pd.DataFrame | None,
+    *,
+    full_history: pd.DataFrame | None = None,
+    include_holdings_detail: bool = False,
+) -> Fundamentals:
     start_date = None
     end_date = None
     annual_return_pct = None
@@ -64,6 +139,8 @@ def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) 
     sharpe_ratio = None
     sharpe_ratio_adj = None
     trailing_eps = None
+    holdings_detail = _holding_detail_for_ticker(snapshot.ticker) if include_holdings_detail else None
+    return_windows = _compute_return_windows(full_history if full_history is not None else history)
 
     if (
         snapshot.regular_market_price not in (None, 0)
@@ -113,6 +190,21 @@ def _build_fundamentals(snapshot: TickerSnapshot, history: pd.DataFrame | None) 
         beta_vs_spy=beta_vs_spy,
         sharpe_ratio=sharpe_ratio,
         sharpe_ratio_adj=sharpe_ratio_adj,
+        holdings_quantity=(holdings_detail or {}).get("quantity"),
+        holdings_buy_date=(holdings_detail or {}).get("buy_date"),
+        holdings_bought_at=(holdings_detail or {}).get("bought_at"),
+        holdings_market_value=(holdings_detail or {}).get("market_value"),
+        holdings_gain=(holdings_detail or {}).get("gain"),
+        holdings_income=(holdings_detail or {}).get("income"),
+        return_1d_pct=return_windows["return_1d_pct"],
+        return_1w_pct=return_windows["return_1w_pct"],
+        return_1m_pct=return_windows["return_1m_pct"],
+        return_3m_pct=return_windows["return_3m_pct"],
+        return_6m_pct=return_windows["return_6m_pct"],
+        return_1y_pct=return_windows["return_1y_pct"],
+        return_2y_pct=return_windows["return_2y_pct"],
+        return_5y_pct=return_windows["return_5y_pct"],
+        return_10y_pct=return_windows["return_10y_pct"],
     )
 
 
@@ -213,6 +305,34 @@ def _compute_dividend_labels(dividends_to_plot: pd.DataFrame, dividend_history: 
     ]
 
 
+def _build_rebased_benchmark_series(
+    reference_history: pd.DataFrame,
+    benchmark_history: pd.DataFrame,
+) -> pd.Series | None:
+    if (
+        reference_history.empty
+        or benchmark_history.empty
+        or "Adj Close" not in benchmark_history.columns
+        or "Close" not in reference_history.columns
+    ):
+        return None
+
+    benchmark_series = benchmark_history["Adj Close"].dropna().copy()
+    if benchmark_series.empty:
+        return None
+
+    benchmark_series.index = pd.to_datetime(benchmark_series.index).tz_localize(None)
+    aligned_benchmark = benchmark_series.reindex(pd.DatetimeIndex(reference_history.index)).ffill().bfill()
+    if aligned_benchmark.empty or pd.isna(aligned_benchmark.iloc[0]) or aligned_benchmark.iloc[0] == 0:
+        return None
+
+    start_value = _safe_float(reference_history["Close"].iloc[0])
+    if start_value in (None, 0):
+        return None
+
+    return (aligned_benchmark / aligned_benchmark.iloc[0]) * start_value
+
+
 def analyze_dividend_ticker(ticker: str, start_date: date) -> DividendAnalysisResult:
     try:
         snapshot, _, _ = get_ticker_snapshot(ticker)
@@ -220,19 +340,27 @@ def analyze_dividend_ticker(ticker: str, start_date: date) -> DividendAnalysisRe
         if history.empty:
             raise MissingDataError(f"No price history is available for {ticker} in the selected date range.")
         full_history = get_full_price_history(ticker)
+        benchmark_history = get_full_price_history(BENCHMARK_TICKER)
 
-        fundamentals = _build_fundamentals(snapshot, history)
+        fundamentals = _build_fundamentals(
+            snapshot,
+            history,
+            full_history=full_history,
+            include_holdings_detail=True,
+        )
         plot_history = history.copy()
         plot_history["Adj Close Rebased"] = (
             plot_history["Adj Close"] + (plot_history["Close"].iloc[0] - plot_history["Adj Close"].iloc[0])
         )
         dividends_to_plot = plot_history[plot_history["Dividends"] > 0]
         bar_labels = _compute_dividend_labels(dividends_to_plot, full_history)
+        benchmark_series = _build_rebased_benchmark_series(plot_history, benchmark_history)
         figure = build_dividend_chart(
             snapshot,
             plot_history,
             dividends_to_plot,
             bar_labels,
+            benchmark_series=benchmark_series,
             show_dividend_bars=_should_show_dividend_bars(dividends_to_plot, plot_history),
         )
 
@@ -375,7 +503,13 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
         if history.empty:
             raise MissingDataError(f"No price history is available for {ticker} in the selected date range.")
         price_series = get_daily_close_history(ticker, start_date, date.today())
-        fundamentals = _build_fundamentals(snapshot, history)
+        full_history = get_full_price_history(ticker)
+        fundamentals = _build_fundamentals(
+            snapshot,
+            history,
+            full_history=full_history,
+            include_holdings_detail=True,
+        )
     except Exception as exc:
         return ValuationAnalysisResult(ticker=ticker, issue=to_issue(exc))
 
@@ -433,7 +567,12 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
     return result
 
 
-def fundamentals_to_frame(fundamentals_list: list[Fundamentals], include_eps: bool = False) -> pd.DataFrame:
+def fundamentals_to_frame(
+    fundamentals_list: list[Fundamentals],
+    include_eps: bool = False,
+    include_holdings: bool = False,
+    include_return_windows: bool = False,
+) -> pd.DataFrame:
     if not fundamentals_list:
         return pd.DataFrame()
 
@@ -452,13 +591,40 @@ def fundamentals_to_frame(fundamentals_list: list[Fundamentals], include_eps: bo
     ]
     if include_eps:
         rows.insert(3, ("EPS", "trailing_eps"))
+    if include_holdings:
+        asset_type_index = next(
+            (index for index, (_, field_name) in enumerate(rows) if field_name == "asset_type"),
+            len(rows) - 1,
+        )
+        rows[asset_type_index + 1:asset_type_index + 1] = [
+            ("Quantity", "holdings_quantity"),
+            ("Buy Date", "holdings_buy_date"),
+            ("Bought At", "holdings_bought_at"),
+            ("Market Value", "holdings_market_value"),
+            ("Gain (%)", "holdings_gain"),
+            ("Income", "holdings_income"),
+        ]
+    if include_return_windows:
+        rows.extend(
+            [
+                ("Return 1D (%)", "return_1d_pct"),
+                ("Return 1W (%)", "return_1w_pct"),
+                ("Return 1M (%)", "return_1m_pct"),
+                ("Return 3M (%)", "return_3m_pct"),
+                ("Return 6M (%)", "return_6m_pct"),
+                ("Return 1Y (%)", "return_1y_pct"),
+                ("Return 2Y (%)", "return_2y_pct"),
+                ("Return 5Y (%)", "return_5y_pct"),
+                ("Return 10Y (%)", "return_10y_pct"),
+            ]
+        )
 
     columns = {}
     for fundamentals in fundamentals_list:
         columns[fundamentals.ticker] = {
             label: (
                 getattr(fundamentals, field_name) * 100
-                if field_name == "dividend_yield" and getattr(fundamentals, field_name) is not None
+                if field_name in {"dividend_yield", "holdings_gain"} and getattr(fundamentals, field_name) is not None
                 else getattr(fundamentals, field_name)
             )
             for label, field_name in rows

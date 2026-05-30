@@ -127,11 +127,24 @@ def _cached_history_is_fresh(cached_end: date) -> bool:
     return cached_end >= _latest_expected_history_date()
 
 
+def _market_close_for_session(session_date: date) -> datetime:
+    return datetime(
+        session_date.year,
+        session_date.month,
+        session_date.day,
+        MARKET_CLOSE_HOUR,
+        0,
+        0,
+        tzinfo=MARKET_TIMEZONE,
+    )
+
+
 def _snapshot_path_is_fresh(path: Path) -> bool:
     if not path.exists():
         return False
-    file_date = datetime.fromtimestamp(path.stat().st_mtime, tz=MARKET_TIMEZONE).date()
-    return file_date >= _latest_expected_history_date()
+    snapshot_timestamp = datetime.fromtimestamp(path.stat().st_mtime, tz=MARKET_TIMEZONE)
+    required_close_timestamp = _market_close_for_session(_latest_expected_history_date())
+    return snapshot_timestamp >= required_close_timestamp
 
 
 def _write_cached_history(symbol: str, history: pd.DataFrame) -> None:

@@ -309,6 +309,7 @@ def build_dividend_chart(
     price_history: pd.DataFrame,
     dividends_to_plot: pd.DataFrame,
     bar_labels: list[str],
+    benchmark_series: pd.Series | None = None,
     show_dividend_bars: bool = True,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -335,6 +336,18 @@ def build_dividend_chart(
         ),
         secondary_y=False,
     )
+    if benchmark_series is not None and not benchmark_series.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=benchmark_series.index,
+                y=benchmark_series.values,
+                name="SPY Adj Close (rebased)",
+                mode="lines",
+                line=dict(color="#ef4444", width=2),
+                hovertemplate="SPY Rebased=$%{y:.2f}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
     if show_dividend_bars:
         fig.add_trace(
             go.Bar(

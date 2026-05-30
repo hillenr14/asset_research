@@ -180,7 +180,13 @@ def _compute_reinvested_cash_value(index: pd.DatetimeIndex, principal: float) ->
 
 
 def _session_index(start_date: date, end_date: date) -> pd.DatetimeIndex:
-    sessions = NYSE_CALENDAR.sessions_in_range(pd.Timestamp(start_date), pd.Timestamp(end_date))
+    calendar_start = pd.Timestamp(NYSE_CALENDAR.first_session).tz_localize(None)
+    calendar_end = pd.Timestamp(NYSE_CALENDAR.last_session).tz_localize(None)
+    bounded_start = max(pd.Timestamp(start_date), calendar_start)
+    bounded_end = min(pd.Timestamp(end_date), calendar_end)
+    if bounded_start > bounded_end:
+        return pd.DatetimeIndex([])
+    sessions = NYSE_CALENDAR.sessions_in_range(bounded_start, bounded_end)
     return pd.DatetimeIndex(pd.to_datetime(sessions).tz_localize(None))
 
 
@@ -265,6 +271,49 @@ def build_holdings_analysis_table() -> pd.DataFrame:
         "Income",
     ]
     return source[ordered_columns]
+
+
+@st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
+def build_holdings_ticker_details() -> pd.DataFrame:
+    holdings = build_holdings_analysis_table().copy()
+    if holdings.empty:
+        return pd.DataFrame(
+            columns=[
+                "Ticker",
+                "Quantity",
+                "Buy Date",
+                "Bought at",
+                "Market Value",
+                "Gain",
+                "Income",
+            ]
+        )
+
+    holdings["Ticker"] = holdings["Ticker"].astype(str).str.strip().str.upper()
+    holdings["Quantity"] = pd.to_numeric(holdings["Quantity"], errors="coerce")
+    holdings["Bought at"] = pd.to_numeric(holdings["Bought at"], errors="coerce")
+    holdings["Market Value"] = pd.to_numeric(holdings["Market Value"], errors="coerce")
+    holdings["Gain"] = pd.to_numeric(holdings["Gain"], errors="coerce")
+    holdings["Income"] = pd.to_numeric(holdings["Income"], errors="coerce")
+    holdings["Buy Date"] = pd.to_datetime(holdings["Buy Date"], errors="coerce")
+
+    records: list[dict[str, object]] = []
+    for ticker, group in holdings.groupby("Ticker", sort=True):
+        ordered_group = group.sort_values(["Buy Date"], kind="stable")
+        latest_row = ordered_group.iloc[-1]
+        records.append(
+            {
+                "Ticker": ticker,
+                "Quantity": float(group["Quantity"].fillna(0.0).sum()),
+                "Buy Date": latest_row["Buy Date"].date() if pd.notna(latest_row["Buy Date"]) else None,
+                "Bought at": _coerce_float(latest_row["Bought at"]),
+                "Market Value": float(group["Market Value"].fillna(0.0).sum()),
+                "Gain": _coerce_float(latest_row["Gain"]),
+                "Income": float(group["Income"].fillna(0.0).sum()),
+            }
+        )
+
+    return pd.DataFrame(records)
 
 
 @st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
@@ -724,5 +773,6 @@ def format_income_by_month_for_display(income_table: pd.DataFrame) -> pd.DataFra
 def refresh_holdings_analysis_data() -> None:
     load_portfolio_holdings.clear()
     build_holdings_analysis_table.clear()
+    build_holdings_ticker_details.clear()
     build_holdings_portfolio_histories.clear()
     build_holdings_income_by_month_table.clear()

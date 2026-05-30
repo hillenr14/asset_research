@@ -56,6 +56,21 @@ class Fundamentals:
     beta_vs_spy: Optional[float] = None
     sharpe_ratio: Optional[float] = None
     sharpe_ratio_adj: Optional[float] = None
+    holdings_quantity: Optional[float] = None
+    holdings_buy_date: Optional[date] = None
+    holdings_bought_at: Optional[float] = None
+    holdings_market_value: Optional[float] = None
+    holdings_gain: Optional[float] = None
+    holdings_income: Optional[float] = None
+    return_1d_pct: Optional[float] = None
+    return_1w_pct: Optional[float] = None
+    return_1m_pct: Optional[float] = None
+    return_3m_pct: Optional[float] = None
+    return_6m_pct: Optional[float] = None
+    return_1y_pct: Optional[float] = None
+    return_2y_pct: Optional[float] = None
+    return_5y_pct: Optional[float] = None
+    return_10y_pct: Optional[float] = None
 
 
 @dataclass
