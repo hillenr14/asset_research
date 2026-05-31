@@ -2,4 +2,7 @@ streamlit
 yfinance
 pandas
 numpy
-matplotlib
+plotly
+exchange_calendars
+numbers-parser
+protobuf==6.33.4
