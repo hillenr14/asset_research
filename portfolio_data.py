@@ -11,9 +11,7 @@ from data_provider import NYSE_CALENDAR, get_full_price_history, get_ticker_snap
 from errors import MissingDataError, ProviderError
 
 
-PORTFOLIO_DOCUMENT_PATH = (
-    Path.home() / "Library/Mobile Documents/com~apple~Numbers/Documents/Investments.numbers"
-)
+PORTFOLIO_DOCUMENT_PATH = Path(__file__).resolve().parent / "Investments.numbers"
 PORTFOLIO_SHEET_NAME = "Holdings"
 PORTFOLIO_TABLE_NAME = "Holdings"
 PORTFOLIO_CACHE_TTL_SECONDS = 86400
