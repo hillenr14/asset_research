@@ -199,7 +199,9 @@ def all_market_history_tickers() -> list[str]:
     ordered_tickers: list[str] = []
     seen: set[str] = set()
     for ticker in tickers:
-        symbol = ticker.strip().upper()
+        if ticker is None or pd.isna(ticker):
+            continue
+        symbol = str(ticker).strip().upper()
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)

@@ -1,0 +1,29 @@
+{
+    "dividend_analysis": {
+        "tickers": [
+            "SPYI",
+            "QQQI",
+            "IWMI",
+            "VT",
+            "AIRR",
+            "CLSE",
+            "LVHI",
+            "SMH"
+        ],
+        "start_date": "2024-05-24"
+    },
+    "pe_analysis": {
+        "tickers": [
+            "MSFT",
+            "AAPL",
+            "META",
+            "AMZN",
+            "GOOG",
+            "TSLA",
+            "NVDA",
+            "HOOD",
+            "LLY"
+        ],
+        "start_date": "2024-05-24"
+    }
+}
