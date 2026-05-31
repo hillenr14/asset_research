@@ -5,7 +5,6 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
 from charts import build_holdings_portfolio_chart
@@ -830,24 +829,11 @@ def render_dividend_main(
             csv_data=dataframe_to_csv_bytes(detail_df),
         )
     with right:
-        chart_figure = go.Figure(result.figure)
-        has_benchmark_trace = any(trace.name == "SPY Adj Close (rebased)" for trace in chart_figure.data)
-        if has_benchmark_trace:
-            benchmark_enabled = st.checkbox(
-                "Benchmark",
-                value=True,
-                key=f"{ticker}-dividend-benchmark-visible",
-            )
-            chart_figure.for_each_trace(
-                lambda trace: trace.update(visible=benchmark_enabled)
-                if trace.name == "SPY Adj Close (rebased)"
-                else None
-            )
-        st.plotly_chart(chart_figure, width="stretch")
+        st.plotly_chart(result.figure, width="stretch")
         render_export_controls(
             label_prefix=f"{ticker}-dividend-chart",
             html_name=f"{ticker.lower()}_dividend_chart.html",
-            html_data=figure_to_html(chart_figure),
+            html_data=figure_to_html(result.figure),
         )
 
 
