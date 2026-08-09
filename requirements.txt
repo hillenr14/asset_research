@@ -4,5 +4,5 @@ pandas
 numpy
 plotly
 exchange_calendars
-numbers-parser
+gspread
 protobuf==6.33.4

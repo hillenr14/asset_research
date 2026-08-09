@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import gspread
 import pandas as pd
 import streamlit as st
-from numbers_parser import Document
 
 from data_provider import NYSE_CALENDAR, get_full_price_history, get_ticker_snapshot
 from errors import MissingDataError, ProviderError
 
 
-PORTFOLIO_DOCUMENT_PATH = Path(__file__).resolve().parent / "Investments.numbers"
+PORTFOLIO_SPREADSHEET_ID = "1wFCcuEYPBGPkteoSmVfvokHSwe7z4U_CKVOW8tig1a4"
 PORTFOLIO_SHEET_NAME = "Holdings"
-PORTFOLIO_TABLE_NAME = "Holdings"
 PORTFOLIO_CACHE_TTL_SECONDS = 86400
 PORTFOLIO_SOURCE_COLUMNS = ["Ticker", "Type", "Loc", "Quantity", "Buy date", "Bought at"]
 CASH_PRICE = 1.0
@@ -29,50 +30,93 @@ def _normalize_portfolio_value(value):
     return value
 
 
-def _load_holdings_table_from_numbers(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise MissingDataError(f"Portfolio file not found: {path}")
+def _google_service_account_info() -> dict:
+    """Load Google credentials without storing secrets in the repository."""
+    try:
+        return dict(st.secrets["gcp_service_account"])
+    except (FileNotFoundError, KeyError):
+        pass
+
+    credentials_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if credentials_json:
+        try:
+            return json.loads(credentials_json)
+        except json.JSONDecodeError as exc:
+            raise ProviderError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.", str(exc)) from exc
 
     try:
-        document = Document(str(path))
+        configured_path = str(st.secrets.get("google_application_credentials", "")).strip()
+    except FileNotFoundError:
+        configured_path = ""
+    credentials_path = configured_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if credentials_path:
+        resolved_path = Path(credentials_path).expanduser()
+        if not resolved_path.is_absolute():
+            resolved_path = Path(__file__).resolve().parent / resolved_path
+        try:
+            with resolved_path.open(encoding="utf-8") as credentials_file:
+                return json.load(credentials_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProviderError(
+                f"Could not read Google credentials at {resolved_path}.", str(exc)
+            ) from exc
+
+    raise MissingDataError(
+        "Google Sheets credentials are not configured. Add gcp_service_account to "
+        ".streamlit/secrets.toml or set GOOGLE_SERVICE_ACCOUNT_JSON."
+    )
+
+
+def _load_holdings_table_from_google_sheet() -> pd.DataFrame:
+    credentials = _google_service_account_info()
+    try:
+        client = gspread.service_account_from_dict(credentials)
+        worksheet = client.open_by_key(PORTFOLIO_SPREADSHEET_ID).worksheet(PORTFOLIO_SHEET_NAME)
+        rows = worksheet.get("A2:G", value_render_option="FORMATTED_VALUE")
     except Exception as exc:
-        raise ProviderError(f"Could not open portfolio file at {path}.", str(exc)) from exc
+        service_account = credentials.get("client_email", "the configured service account")
+        raise ProviderError(
+            f"Could not read the Investments Google Sheet. Confirm it is shared with {service_account}.",
+            str(exc),
+        ) from exc
 
-    for sheet in document.sheets:
-        if sheet.name != PORTFOLIO_SHEET_NAME:
+    if not rows:
+        raise MissingDataError("The Holdings sheet is empty.")
+
+    headers = [str(header).strip() for header in rows[0]]
+    data_rows = []
+    for row in rows[1:]:
+        padded_row = row + [""] * (len(headers) - len(row))
+        ticker = str(padded_row[0]).strip()
+        if not ticker:
+            if data_rows:
+                break
             continue
-        for table in sheet.tables:
-            if table.name != PORTFOLIO_TABLE_NAME:
-                continue
-            rows = table.rows(values_only=True)
-            if not rows:
-                raise MissingDataError("The Holdings table is empty.")
-            headers = [str(header).strip() for header in rows[0]]
-            data_rows = rows[1:]
-            frame = pd.DataFrame(data_rows, columns=headers)
-            frame = frame.map(_normalize_portfolio_value)
-            for column in frame.columns:
-                if frame[column].dtype == "object":
-                    frame[column] = frame[column].where(frame[column].notna(), "").astype(str)
-            missing_columns = [column for column in PORTFOLIO_SOURCE_COLUMNS if column not in frame.columns]
-            if missing_columns:
-                raise MissingDataError(
-                    f"Holdings table is missing required columns: {', '.join(missing_columns)}"
-                )
+        if ticker.casefold() == "ticker":
+            continue
+        data_rows.append(padded_row)
 
-            filtered = frame[PORTFOLIO_SOURCE_COLUMNS].copy()
-            filtered = filtered.rename(columns={"Buy date": "Buy Date"})
-            filtered["Ticker"] = filtered["Ticker"].astype(str).str.strip().str.upper()
-            filtered = filtered[filtered["Ticker"] != ""].copy()
-            return filtered.reset_index(drop=True)
+    if not data_rows:
+        raise MissingDataError("The Holdings sheet does not contain any holdings rows.")
 
-    raise MissingDataError("Could not find the Holdings table in Investments.numbers.")
+    frame = pd.DataFrame([row[: len(headers)] for row in data_rows], columns=headers)
+    frame = frame.map(_normalize_portfolio_value)
+    missing_columns = [column for column in PORTFOLIO_SOURCE_COLUMNS if column not in frame.columns]
+    if missing_columns:
+        raise MissingDataError(
+            f"Holdings sheet is missing required columns: {', '.join(missing_columns)}"
+        )
+
+    filtered = frame[PORTFOLIO_SOURCE_COLUMNS].copy()
+    filtered = filtered.rename(columns={"Buy date": "Buy Date"})
+    filtered["Ticker"] = filtered["Ticker"].astype(str).str.strip().str.upper()
+    filtered = filtered[filtered["Ticker"] != ""].copy()
+    return filtered.reset_index(drop=True)
 
 
-@st.cache_data(persist="disk", show_spinner=False)
+@st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
 def load_portfolio_holdings() -> pd.DataFrame:
-    holdings = _load_holdings_table_from_numbers(PORTFOLIO_DOCUMENT_PATH)
-    return holdings
+    return _load_holdings_table_from_google_sheet()
 
 
 def portfolio_history_tickers() -> list[str]:
@@ -105,7 +149,8 @@ def _coerce_float(value):
     if value in ("", None) or pd.isna(value):
         return None
     try:
-        return float(value)
+        cleaned = str(value).strip().replace("$", "").replace(",", "").replace("%", "")
+        return float(cleaned)
     except (TypeError, ValueError):
         return None
 
@@ -486,6 +531,9 @@ def build_holdings_portfolio_window(
     assume_full_period: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     holdings = load_portfolio_holdings().copy()
+    holdings = holdings[
+        holdings["Ticker"].astype(str).str.strip().str.casefold() != "ticker"
+    ].copy()
     if holdings.empty:
         return (
             pd.DataFrame(columns=["Portfolio Value", "Reinvested Portfolio Value"]),
@@ -773,4 +821,5 @@ def refresh_holdings_analysis_data() -> None:
     build_holdings_analysis_table.clear()
     build_holdings_ticker_details.clear()
     build_holdings_portfolio_histories.clear()
+    build_holdings_portfolio_window.clear()
     build_holdings_income_by_month_table.clear()

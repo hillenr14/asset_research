@@ -429,7 +429,7 @@ def build_holdings_portfolio_chart(
             go.Bar(
                 x=monthly_income_history.index,
                 y=monthly_income_history["Income"],
-                name="Monthly Income",
+                name="Estimated Monthly Income",
                 marker=dict(color="rgba(52, 211, 153, 0.55)"),
                 text=income_labels,
                 textposition="outside",
@@ -437,7 +437,7 @@ def build_holdings_portfolio_chart(
                 constraintext="none",
                 cliponaxis=False,
                 width=bar_width_ms,
-                hovertemplate="Monthly Income=$%{y:,.2f}<extra></extra>",
+                hovertemplate="Estimated Monthly Income=$%{y:,.2f}<extra></extra>",
             ),
             secondary_y=True,
         )
@@ -446,7 +446,7 @@ def build_holdings_portfolio_chart(
         fig,
         title,
         "Portfolio Value ($)",
-        "Monthly Income ($)",
+        "Estimated Monthly Income ($)",
     )
     fig.update_yaxes(tickprefix="$", separatethousands=True, secondary_y=False)
     fig.update_yaxes(

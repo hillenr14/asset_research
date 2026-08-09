@@ -20,9 +20,6 @@ from config import (
 from data_provider import clear_in_memory_price_history_cache, get_full_price_history, get_ticker_snapshot, warm_price_history_cache
 from portfolio_data import (
     HOLDINGS_NAVIGABLE_TYPES,
-    PORTFOLIO_DOCUMENT_PATH,
-    PORTFOLIO_SHEET_NAME,
-    PORTFOLIO_TABLE_NAME,
     build_holdings_analysis_table,
     build_holdings_income_by_month_table,
     build_holdings_portfolio_histories,
@@ -970,7 +967,7 @@ def render_analysis_summary(mode: str) -> None:
 def render_holdings_summary() -> None:
     st.header("Holdings Analysis")
     st.markdown(
-        '<div class="pane-copy">Imported core holdings data from the Numbers workbook, enriched with live yfinance fields and calculated portfolio metrics.</div>',
+        '<div class="pane-copy">Imported core holdings data from the Investments Google Sheet, enriched with live yfinance fields and calculated portfolio metrics.</div>',
         unsafe_allow_html=True,
     )
     holdings_df = build_holdings_analysis_table()
@@ -1054,7 +1051,7 @@ def render_holdings_summary() -> None:
             build_holdings_portfolio_chart(
                 portfolio_value_history,
                 monthly_income_history,
-                title="Holdings Portfolio - Actual Held Period",
+                title="Holdings Portfolio - Current Holdings Since Recorded Buy Dates (Estimated)",
                 show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
             ),
             width="stretch",
