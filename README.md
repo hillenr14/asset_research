@@ -79,7 +79,7 @@ Holdings are read until the first blank ticker after data begins. Cash rows use 
 streamlit run app.py
 ```
 
-The app refreshes holdings and warms the market-history cache when it starts, so Google Sheets credentials must be configured even if you initially plan to use only dividend or valuation analysis.
+Dividend and valuation pages load independently from Google Sheets. Google credentials are required only when opening Holdings Analysis. Market data is loaded lazily for the active page and selected assets.
 
 Use the controls at the top of the page to choose a lookback period and switch among:
 
@@ -100,6 +100,17 @@ Cached data is reused during the trading day and refreshed when it no longer inc
 
 Data from Yahoo Finance may be delayed, incomplete, or unavailable for some symbols. The dashboard is a research tool and should not be treated as investment advice.
 
+## Testing
+
+Install the development dependencies and run the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The GitHub Actions workflow runs the same suite for pushes and pull requests. Tests use deterministic fixtures and should not require live Yahoo Finance or Google Sheets access.
+
 ## Project structure
 
 - `app.py` — Streamlit application, navigation, and UI state
@@ -112,6 +123,8 @@ Data from Yahoo Finance may be delayed, incomplete, or unavailable for some symb
 - `ui_helpers.py` — validation, formatting, and export helpers
 - `errors.py` — application-specific errors and user-facing issue conversion
 - `requirements.txt` — Python dependencies
+- `requirements-dev.txt` — development and test dependencies
+- `tests/` — automated regression tests
 - `config.json` — current dividend and valuation ticker lists
 - `edgar_strategy.py` — separate SEC filing strategy research script
 - `edgar_strategy_plan.md` — notes for the SEC filing strategy work

@@ -333,7 +333,12 @@ def _build_rebased_benchmark_series(
     return (aligned_benchmark / aligned_benchmark.iloc[0]) * start_value
 
 
-def analyze_dividend_ticker(ticker: str, start_date: date) -> DividendAnalysisResult:
+def analyze_dividend_ticker(
+    ticker: str,
+    start_date: date,
+    *,
+    include_holdings_detail: bool = False,
+) -> DividendAnalysisResult:
     try:
         snapshot, _, _ = get_ticker_snapshot(ticker)
         history = get_price_history(ticker, start_date, date.today())
@@ -346,7 +351,7 @@ def analyze_dividend_ticker(ticker: str, start_date: date) -> DividendAnalysisRe
             snapshot,
             history,
             full_history=full_history,
-            include_holdings_detail=True,
+            include_holdings_detail=include_holdings_detail,
         )
         plot_history = history.copy()
         plot_history["Adj Close Rebased"] = (
@@ -496,7 +501,12 @@ def _compute_free_cash_flow_inputs(
     return free_cash_flow_per_share.loc[plot_start_date:]
 
 
-def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysisResult:
+def analyze_valuation_ticker(
+    ticker: str,
+    start_date: date,
+    *,
+    include_holdings_detail: bool = False,
+) -> ValuationAnalysisResult:
     try:
         snapshot, quarterly_income_stmt, quarterly_cashflow_stmt = get_ticker_snapshot(ticker)
         history = get_price_history(ticker, start_date, date.today())
@@ -508,7 +518,7 @@ def analyze_valuation_ticker(ticker: str, start_date: date) -> ValuationAnalysis
             snapshot,
             history,
             full_history=full_history,
-            include_holdings_detail=True,
+            include_holdings_detail=include_holdings_detail,
         )
     except Exception as exc:
         return ValuationAnalysisResult(ticker=ticker, issue=to_issue(exc))

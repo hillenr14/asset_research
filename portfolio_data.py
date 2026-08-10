@@ -233,6 +233,24 @@ def _session_index(start_date: date, end_date: date) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(pd.to_datetime(sessions).tz_localize(None))
 
 
+def _align_close_series(
+    close_series: pd.Series,
+    target_index: pd.DatetimeIndex,
+) -> pd.Series:
+    """Align closes without using observations later than the target session."""
+    normalized_close = close_series.dropna().copy()
+    normalized_close.index = pd.to_datetime(normalized_close.index).tz_localize(None)
+    normalized_close = normalized_close.sort_index()
+    if normalized_close.empty:
+        return pd.Series(index=target_index, dtype="float64")
+
+    # Include source observations before reindexing so a prior close can carry
+    # forward into a window whose first session has no observation.  Crucially,
+    # forward filling leaves sessions before the first real close empty.
+    combined_index = normalized_close.index.union(target_index).sort_values()
+    return normalized_close.reindex(combined_index).ffill().reindex(target_index)
+
+
 @st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
 def build_holdings_analysis_table() -> pd.DataFrame:
     source = load_portfolio_holdings().copy()
@@ -452,11 +470,16 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
             dividends = history["Dividends"].fillna(0.0)
             dividends.index = pd.to_datetime(dividends.index).tz_localize(None)
 
-            full_year_asset_value = close_series.reindex(full_index).ffill().bfill() * quantity
-            full_year_asset_income = dividends.reindex(full_index, fill_value=0.0) * quantity
+            first_price_date = close_series.index.min().date()
+            actual_start = max(actual_start, first_price_date)
+            aligned_close = _align_close_series(close_series, full_index)
+            aligned_dividends = dividends.reindex(full_index, fill_value=0.0)
+            aligned_dividends.loc[full_index < pd.Timestamp(first_price_date)] = 0.0
+            full_year_asset_value = (aligned_close * quantity).fillna(0.0)
+            full_year_asset_income = aligned_dividends * quantity
             full_year_asset_reinvested_value = _compute_reinvested_asset_value(
-                close_series.reindex(full_index).ffill().bfill(),
-                dividends.reindex(full_index, fill_value=0.0),
+                aligned_close,
+                aligned_dividends,
                 quantity,
             )
 
@@ -476,7 +499,7 @@ def build_holdings_portfolio_histories() -> dict[str, tuple[pd.DataFrame, pd.Dat
                 )
             else:
                 actual_reinvested_slice = _compute_reinvested_asset_value(
-                    close_series.reindex(actual_index).ffill().bfill(),
+                    _align_close_series(close_series, actual_index),
                     dividends.reindex(actual_index, fill_value=0.0),
                     quantity,
                 )
@@ -618,7 +641,12 @@ def build_holdings_portfolio_window(
             dividends = history["Dividends"].fillna(0.0)
             dividends.index = pd.to_datetime(dividends.index).tz_localize(None)
 
-            aligned_close = close_series.reindex(asset_index).ffill().bfill()
+            first_price_date = close_series.index.min().date()
+            active_start = max(active_start, first_price_date)
+            if active_start > end_date:
+                continue
+            asset_index = _session_index(active_start, end_date)
+            aligned_close = _align_close_series(close_series, asset_index)
             aligned_dividends = dividends.reindex(asset_index, fill_value=0.0)
             asset_value = aligned_close * quantity
             asset_income = aligned_dividends * quantity
