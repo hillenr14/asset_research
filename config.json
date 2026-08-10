@@ -3,14 +3,16 @@
         "tickers": [
             "SPYI",
             "QQQI",
-            "IWMI",
             "VT",
             "AIRR",
             "CLSE",
             "LVHI",
-            "SMH"
+            "SMH",
+            "BND",
+            "SGOV",
+            "VTV"
         ],
-        "start_date": "2024-05-24"
+        "start_date": "2024-08-09"
     },
     "pe_analysis": {
         "tickers": [
@@ -24,6 +26,6 @@
             "HOOD",
             "LLY"
         ],
-        "start_date": "2024-05-24"
+        "start_date": "2024-08-09"
     }
 }
