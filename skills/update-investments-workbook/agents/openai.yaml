@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update Investments Workbook"
+  short_description: "Reconcile recurring investment account exports"
+  default_prompt: "Use $update-investments-workbook to import the newest account exports and reconcile the Investments Google Sheet."
