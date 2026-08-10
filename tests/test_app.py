@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import Mock
 
 import pandas as pd
@@ -23,7 +24,8 @@ def test_initial_dividend_page_is_lazy_and_independent_of_google_sheets(
     monkeypatch.setattr(portfolio_data, "load_portfolio_holdings", fail_if_holdings_are_loaded)
     monkeypatch.setattr(metrics, "analyze_dividend_ticker", analyzer)
 
-    app = AppTest.from_file("app.py", default_timeout=15).run()
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(app_path, default_timeout=15).run()
 
     assert len(app.exception) == 0
     assert analyzer.call_count == 1
