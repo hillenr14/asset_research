@@ -5,6 +5,7 @@ import gzip
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -44,6 +45,10 @@ SEC_REQUEST_PAUSE_SECONDS = 0.2
 BUY = "BUY"
 HOLD = "HOLD"
 SELL = "SELL"
+
+_DISCRETE_QUARTER_MAX_DAYS = 120
+_QUARTER_FRAME_PATTERN = re.compile(r"(?:CY|FY)\d{4}Q([1-4])$", re.IGNORECASE)
+_NON_ADDITIVE_DURATION_CONCEPTS = {"diluted_shares", "eps_diluted"}
 
 
 @dataclass
@@ -521,6 +526,59 @@ def _pick_fiscal_year(record: pd.Series) -> int | None:
     return None
 
 
+def _frame_quarter(record: pd.Series) -> str | None:
+    frame = record.get("frame")
+    if not isinstance(frame, str):
+        return None
+    match = _QUARTER_FRAME_PATTERN.fullmatch(frame.strip())
+    return f"Q{match.group(1)}" if match else None
+
+
+def _is_discrete_duration_fact(record: pd.Series) -> bool:
+    """Return whether an SEC duration fact represents one fiscal quarter."""
+    if _frame_quarter(record) is not None:
+        return True
+    days = record.get("days")
+    return pd.notna(days) and 0 <= float(days) <= _DISCRETE_QUARTER_MAX_DAYS
+
+
+def _latest_fact(frame: pd.DataFrame) -> pd.Series | None:
+    if frame.empty:
+        return None
+    return frame.sort_values(["filed", "end", "accn"], na_position="first").iloc[-1]
+
+
+def _quarter_facts(group: pd.DataFrame, quarter: str) -> pd.DataFrame:
+    frame_quarters = group.apply(_frame_quarter, axis=1)
+    return group[(group["fp"] == quarter) | (frame_quarters == quarter)]
+
+
+def _select_discrete_quarter(group: pd.DataFrame, quarter: str) -> pd.Series | None:
+    candidates = _quarter_facts(group, quarter)
+    if candidates.empty:
+        return None
+    discrete_mask = candidates.apply(_is_discrete_duration_fact, axis=1)
+    return _latest_fact(candidates[discrete_mask])
+
+
+def _select_cumulative_quarter(
+    group: pd.DataFrame,
+    quarter: str,
+    start: pd.Timestamp | None = None,
+) -> pd.Series | None:
+    candidates = _quarter_facts(group, quarter)
+    if candidates.empty:
+        return None
+    discrete_mask = candidates.apply(_is_discrete_duration_fact, axis=1)
+    candidates = candidates[~discrete_mask]
+    if start is not None and pd.notna(start):
+        matching_start = candidates[candidates["start"] == start]
+        if matching_start.empty:
+            return None
+        candidates = matching_start
+    return _latest_fact(candidates)
+
+
 def _build_duration_quarter_series(raw_df: pd.DataFrame) -> pd.DataFrame:
     if raw_df.empty:
         return raw_df
@@ -535,46 +593,64 @@ def _build_duration_quarter_series(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     records: list[dict[str, Any]] = []
 
-    for fiscal_year, group in frame.groupby("fiscal_year"):
-        annual = group[(group["form"] == "10-K") & (group["days"] >= 300)].sort_values(["filed", "end"])
-        q1 = group[group["fp"] == "Q1"].sort_values(["filed", "end"])
-        q2 = group[group["fp"] == "Q2"].sort_values(["filed", "end"])
-        q3 = group[group["fp"] == "Q3"].sort_values(["filed", "end"])
+    for _, group in frame.groupby("fiscal_year"):
+        annual = group[(group["form"] == "10-K") & (group["days"] >= 300)]
+        annual_row = _latest_fact(annual)
+        concept_values = group["concept"].dropna().astype(str)
+        concept = concept_values.iloc[0] if not concept_values.empty else None
+        additive = concept not in _NON_ADDITIVE_DURATION_CONCEPTS
 
-        q1_row = q1.iloc[-1] if not q1.empty else None
-        q2_row = q2.iloc[-1] if not q2.empty else None
-        q3_row = q3.iloc[-1] if not q3.empty else None
-        annual_row = annual.iloc[-1] if not annual.empty else None
+        selected_rows: dict[str, pd.Series] = {}
+        quarter_values: dict[str, float] = {}
 
-        q1_value = None
-        q2_value = None
-        q3_value = None
-
+        q1_row = _select_discrete_quarter(group, "Q1")
         if q1_row is not None:
-            q1_value = float(q1_row["val"])
-            records.append({**q1_row.to_dict(), "quarter": "Q1", "single_quarter_val": q1_value})
+            selected_rows["Q1"] = q1_row
+            quarter_values["Q1"] = float(q1_row["val"])
 
+        q2_row = _select_discrete_quarter(group, "Q2")
+        q2_cumulative = _select_cumulative_quarter(group, "Q2")
         if q2_row is not None:
-            if q1_value is not None and pd.notna(q2_row.get("val")):
-                q2_value = float(q2_row["val"]) - q1_value
-            elif pd.notna(q2_row.get("days")) and q2_row["days"] <= 120:
-                q2_value = float(q2_row["val"])
-            if q2_value is not None:
-                records.append({**q2_row.to_dict(), "quarter": "Q2", "single_quarter_val": q2_value})
+            selected_rows["Q2"] = q2_row
+            quarter_values["Q2"] = float(q2_row["val"])
+        elif additive and q2_cumulative is not None:
+            q1_base = _select_cumulative_quarter(group, "Q1", q2_cumulative.get("start"))
+            if q1_base is None:
+                q1_base = q1_row
+                if q1_base is not None and q1_base.get("start") != q2_cumulative.get("start"):
+                    q1_base = None
+            if q1_base is not None:
+                selected_rows["Q2"] = q2_cumulative
+                quarter_values["Q2"] = float(q2_cumulative["val"]) - float(q1_base["val"])
 
+        q3_row = _select_discrete_quarter(group, "Q3")
+        q3_cumulative = _select_cumulative_quarter(group, "Q3")
         if q3_row is not None:
-            if q2_row is not None and pd.notna(q3_row.get("val")) and pd.notna(q2_row.get("val")):
-                q3_value = float(q3_row["val"]) - float(q2_row["val"])
-            elif pd.notna(q3_row.get("days")) and q3_row["days"] <= 120:
-                q3_value = float(q3_row["val"])
-            if q3_value is not None:
-                records.append({**q3_row.to_dict(), "quarter": "Q3", "single_quarter_val": q3_value})
+            selected_rows["Q3"] = q3_row
+            quarter_values["Q3"] = float(q3_row["val"])
+        elif additive and q3_cumulative is not None:
+            q2_base = _select_cumulative_quarter(group, "Q2", q3_cumulative.get("start"))
+            if q2_base is not None:
+                selected_rows["Q3"] = q3_cumulative
+                quarter_values["Q3"] = float(q3_cumulative["val"]) - float(q2_base["val"])
 
-        if annual_row is not None:
-            components = [value for value in [q1_value, q2_value, q3_value] if value is not None]
-            if len(components) == 3 and pd.notna(annual_row.get("val")):
-                q4_value = float(annual_row["val"]) - float(sum(components))
-                records.append({**annual_row.to_dict(), "quarter": "Q4", "single_quarter_val": q4_value})
+        q4_row = _select_discrete_quarter(group, "Q4")
+        if q4_row is not None:
+            selected_rows["Q4"] = q4_row
+            quarter_values["Q4"] = float(q4_row["val"])
+        elif additive and annual_row is not None and len(quarter_values) == 3:
+            selected_rows["Q4"] = annual_row
+            quarter_values["Q4"] = float(annual_row["val"]) - sum(quarter_values.values())
+
+        for quarter in ["Q1", "Q2", "Q3", "Q4"]:
+            if quarter in selected_rows:
+                records.append(
+                    {
+                        **selected_rows[quarter].to_dict(),
+                        "quarter": quarter,
+                        "single_quarter_val": quarter_values[quarter],
+                    }
+                )
 
     quarter_df = pd.DataFrame(records)
     if quarter_df.empty:
@@ -585,6 +661,39 @@ def _build_duration_quarter_series(raw_df: pd.DataFrame) -> pd.DataFrame:
     quarter_df = quarter_df.sort_values(["end", "filed", "accn"])
     quarter_df = quarter_df.drop_duplicates(subset=["end"], keep="last").reset_index(drop=True)
     return quarter_df
+
+
+def _merge_concept_series(series_by_concept: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    merged: pd.DataFrame | None = None
+    filing_date_columns: list[str] = []
+
+    for concept, series in series_by_concept.items():
+        filing_date_column = f"__{concept}_filing_date"
+        value_column = concept if concept in series.columns else "val"
+        normalized = series[["period_end", "filing_date", value_column]].copy()
+        normalized["period_end"] = pd.to_datetime(normalized["period_end"], errors="coerce")
+        normalized["filing_date"] = pd.to_datetime(normalized["filing_date"], errors="coerce")
+        normalized = normalized.sort_values(["period_end", "filing_date"])
+        normalized = normalized.drop_duplicates(subset=["period_end"], keep="last")
+        normalized = normalized.rename(
+            columns={"filing_date": filing_date_column, value_column: concept}
+        )
+        filing_date_columns.append(filing_date_column)
+        merged = (
+            normalized
+            if merged is None
+            else merged.merge(normalized, on="period_end", how="outer", validate="one_to_one")
+        )
+
+    if merged is None:
+        return pd.DataFrame(columns=["period_end", "filing_date"])
+
+    merged["filing_date"] = merged[filing_date_columns].max(axis=1)
+    merged = merged.drop(columns=filing_date_columns)
+    ordered_columns = ["period_end", "filing_date"] + [
+        column for column in merged.columns if column not in {"period_end", "filing_date"}
+    ]
+    return merged[ordered_columns]
 
 
 def _prepare_filing_lookup(filing_records: list[dict[str, Any]]) -> pd.DataFrame:
@@ -654,16 +763,8 @@ def build_financial_datasets(
         if not annual_df.empty:
             annual_series[concept] = annual_df[["period_end", "filing_date", "val"]].rename(columns={"val": concept})
 
-    quarterly_df = None
-    for concept, series in quarter_series.items():
-        quarterly_df = series if quarterly_df is None else quarterly_df.merge(series, on=["period_end", "filing_date"], how="outer")
-
-    annual_df = None
-    for concept, series in annual_series.items():
-        annual_df = series if annual_df is None else annual_df.merge(series, on=["period_end", "filing_date"], how="outer")
-
-    quarterly = quarterly_df if quarterly_df is not None else pd.DataFrame(columns=["period_end", "filing_date"])
-    annual = annual_df if annual_df is not None else pd.DataFrame(columns=["period_end", "filing_date"])
+    quarterly = _merge_concept_series(quarter_series)
+    annual = _merge_concept_series(annual_series)
 
     quarterly["period_end"] = pd.to_datetime(quarterly["period_end"], errors="coerce")
     quarterly["filing_date"] = pd.to_datetime(quarterly["filing_date"], errors="coerce")

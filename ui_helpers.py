@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from models import DividendAnalysisResult, Fundamentals, ValuationAnalysisResult
+from ticker_symbols import ticker_symbol_is_valid
 
 
 def normalize_single_ticker(text: str) -> str:
@@ -45,6 +46,8 @@ def validate_single_ticker(ticker: str) -> list[str]:
         errors.append("Enter a ticker before adding it to the list.")
     elif " " in ticker:
         errors.append("Enter one ticker at a time.")
+    elif not ticker_symbol_is_valid(ticker):
+        errors.append("Ticker contains unsupported characters.")
     return errors
 
 
