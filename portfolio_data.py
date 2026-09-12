@@ -15,8 +15,14 @@ from errors import MissingDataError, ProviderError
 
 PORTFOLIO_SPREADSHEET_ID = "1wFCcuEYPBGPkteoSmVfvokHSwe7z4U_CKVOW8tig1a4"
 PORTFOLIO_SHEET_NAME = "Holdings"
+PORTFOLIO_SOLD_SHEET_NAME = "Sold"
 PORTFOLIO_CACHE_TTL_SECONDS = 86400
 PORTFOLIO_SOURCE_COLUMNS = ["Ticker", "Type", "Loc", "Quantity", "Buy date", "Bought at"]
+PORTFOLIO_HISTORY_SHEETS = {
+    "401K": ("history_401k_import", "Date", "Net Amount", "Activity Description", "A1:M"),
+    "VG": ("Holdings VG import", "Trade Date", "Net Amount", "Transaction Type", "A1:M"),
+    "CS": ("History CS ", "Date", "Amount", "Action", "A1:H"),
+}
 CASH_PRICE = 1.0
 CASH_YIELD = 0.035
 HOLDINGS_NAVIGABLE_TYPES = {"stock", "income", "growth"}
@@ -68,11 +74,21 @@ def _google_service_account_info() -> dict:
 
 
 def _load_holdings_table_from_google_sheet() -> pd.DataFrame:
+    return _load_portfolio_table_from_google_sheet(
+        PORTFOLIO_SHEET_NAME,
+        required_columns=PORTFOLIO_SOURCE_COLUMNS,
+    )
+
+
+def _load_portfolio_table_from_google_sheet(
+    sheet_name: str,
+    required_columns: list[str],
+) -> pd.DataFrame:
     credentials = _google_service_account_info()
     try:
         client = gspread.service_account_from_dict(credentials)
-        worksheet = client.open_by_key(PORTFOLIO_SPREADSHEET_ID).worksheet(PORTFOLIO_SHEET_NAME)
-        rows = worksheet.get("A2:G", value_render_option="FORMATTED_VALUE")
+        worksheet = client.open_by_key(PORTFOLIO_SPREADSHEET_ID).worksheet(sheet_name)
+        rows = worksheet.get("A2:M", value_render_option="FORMATTED_VALUE")
     except Exception as exc:
         service_account = credentials.get("client_email", "the configured service account")
         raise ProviderError(
@@ -81,7 +97,7 @@ def _load_holdings_table_from_google_sheet() -> pd.DataFrame:
         ) from exc
 
     if not rows:
-        raise MissingDataError("The Holdings sheet is empty.")
+        raise MissingDataError(f"The {sheet_name} sheet is empty.")
 
     headers = [str(header).strip() for header in rows[0]]
     data_rows = []
@@ -97,17 +113,17 @@ def _load_holdings_table_from_google_sheet() -> pd.DataFrame:
         data_rows.append(padded_row)
 
     if not data_rows:
-        raise MissingDataError("The Holdings sheet does not contain any holdings rows.")
+        raise MissingDataError(f"The {sheet_name} sheet does not contain any portfolio rows.")
 
     frame = pd.DataFrame([row[: len(headers)] for row in data_rows], columns=headers)
     frame = frame.map(_normalize_portfolio_value)
-    missing_columns = [column for column in PORTFOLIO_SOURCE_COLUMNS if column not in frame.columns]
+    missing_columns = [column for column in required_columns if column not in frame.columns]
     if missing_columns:
         raise MissingDataError(
-            f"Holdings sheet is missing required columns: {', '.join(missing_columns)}"
+            f"{sheet_name} sheet is missing required columns: {', '.join(missing_columns)}"
         )
 
-    filtered = frame[PORTFOLIO_SOURCE_COLUMNS].copy()
+    filtered = frame[required_columns].copy()
     filtered = filtered.rename(columns={"Buy date": "Buy Date"})
     filtered["Ticker"] = filtered["Ticker"].astype(str).str.strip().str.upper()
     filtered = filtered[filtered["Ticker"] != ""].copy()
@@ -117,6 +133,14 @@ def _load_holdings_table_from_google_sheet() -> pd.DataFrame:
 @st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
 def load_portfolio_holdings() -> pd.DataFrame:
     return _load_holdings_table_from_google_sheet()
+
+
+@st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
+def load_portfolio_sold() -> pd.DataFrame:
+    return _load_portfolio_table_from_google_sheet(
+        PORTFOLIO_SOLD_SHEET_NAME,
+        required_columns=[*PORTFOLIO_SOURCE_COLUMNS, "Sell date"],
+    ).rename(columns={"Sell date": "Sell Date"})
 
 
 def portfolio_history_tickers() -> list[str]:
@@ -153,6 +177,123 @@ def _coerce_float(value):
         return float(cleaned)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_currency_amount(value) -> float | None:
+    if value in ("", None) or pd.isna(value):
+        return None
+    cleaned = str(value).strip().replace("$", "").replace(",", "")
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = f"-{cleaned[1:-1]}"
+    try:
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cash_flow_rows(
+    values: list[list[str]],
+    date_column: str,
+    amount_column: str,
+    activity_column: str,
+) -> list[dict]:
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(values)
+            if date_column in row and amount_column in row and activity_column in row
+        ),
+        None,
+    )
+    if header_index is None:
+        return []
+
+    headers = [str(value).strip() for value in values[header_index]]
+    date_index = headers.index(date_column)
+    amount_index = headers.index(amount_column)
+    activity_index = headers.index(activity_column)
+    records = []
+    for row in values[header_index + 1 :]:
+        padded = row + [""] * (len(headers) - len(row))
+        flow_date = _coerce_date(padded[date_index])
+        amount = _coerce_currency_amount(padded[amount_index])
+        activity = str(padded[activity_index]).strip().casefold()
+        is_capital_trade = (
+            activity.startswith("buy")
+            or activity.startswith("sell")
+            or "redemption" in activity
+        )
+        if flow_date is not None and amount is not None and is_capital_trade:
+            records.append({"Date": flow_date, "Amount": amount})
+    return records
+
+
+@st.cache_data(ttl=PORTFOLIO_CACHE_TTL_SECONDS, show_spinner=False)
+def load_portfolio_trade_cash_flows() -> pd.DataFrame:
+    credentials = _google_service_account_info()
+    try:
+        workbook = gspread.service_account_from_dict(credentials).open_by_key(
+            PORTFOLIO_SPREADSHEET_ID
+        )
+        records = []
+        for loc, (sheet_name, date_column, amount_column, activity_column, cell_range) in (
+            PORTFOLIO_HISTORY_SHEETS.items()
+        ):
+            values = workbook.worksheet(sheet_name).get(
+                cell_range,
+                value_render_option="FORMATTED_VALUE",
+            )
+            for record in _cash_flow_rows(
+                values,
+                date_column,
+                amount_column,
+                activity_column,
+            ):
+                records.append({"Loc": loc, **record})
+    except Exception as exc:
+        service_account = credentials.get("client_email", "the configured service account")
+        raise ProviderError(
+            "Could not read transaction history from the Investments Google Sheet. "
+            f"Confirm it is shared with {service_account}.",
+            str(exc),
+        ) from exc
+
+    return pd.DataFrame(records, columns=["Loc", "Date", "Amount"])
+
+
+def _reconstruct_cash_history(
+    holdings: pd.DataFrame,
+    cash_flows: pd.DataFrame,
+    index: pd.DatetimeIndex,
+    end_date: date,
+) -> pd.Series:
+    cash_rows = holdings[
+        holdings["Type"].astype(str).str.strip().str.casefold() == "cash"
+    ].copy()
+    cash_rows["Quantity"] = cash_rows["Quantity"].map(_coerce_float)
+    current_by_loc = cash_rows.groupby("Loc")["Quantity"].sum(min_count=1).fillna(0.0)
+    result = pd.Series(0.0, index=index, dtype="float64")
+
+    for loc, current_cash in current_by_loc.items():
+        loc_flows = cash_flows[
+            cash_flows["Loc"].astype(str).str.strip().str.upper()
+            == str(loc).strip().upper()
+        ].copy()
+        if loc_flows.empty:
+            result = result.add(float(current_cash), fill_value=0.0)
+            continue
+        loc_flows["Date"] = loc_flows["Date"].map(_coerce_date)
+        loc_flows["Amount"] = loc_flows["Amount"].map(_coerce_currency_amount)
+        loc_flows = loc_flows.dropna(subset=["Date", "Amount"])
+        loc_flows = loc_flows[loc_flows["Date"] <= end_date]
+        dated_amounts = loc_flows.groupby("Date")["Amount"].sum()
+        values = [
+            float(current_cash) - float(dated_amounts[dated_amounts.index > timestamp.date()].sum())
+            for timestamp in index
+        ]
+        result = result.add(pd.Series(values, index=index, dtype="float64"), fill_value=0.0)
+
+    return result
 
 
 def _coerce_date(value) -> date | None:
@@ -552,8 +693,14 @@ def build_holdings_portfolio_window(
     start_date: date,
     end_date: date,
     assume_full_period: bool,
+    include_sold: bool = False,
+    reconstruct_cash: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     holdings = load_portfolio_holdings().copy()
+    holdings["Sell Date"] = None
+    if include_sold:
+        sold = load_portfolio_sold().copy()
+        holdings = pd.concat([holdings, sold], ignore_index=True, sort=False)
     holdings = holdings[
         holdings["Ticker"].astype(str).str.strip().str.casefold() != "ticker"
     ].copy()
@@ -565,6 +712,7 @@ def build_holdings_portfolio_window(
 
     holdings["Quantity"] = holdings["Quantity"].map(_coerce_float)
     holdings["Buy Date"] = holdings["Buy Date"].map(_coerce_date)
+    holdings["Sell Date"] = holdings["Sell Date"].map(_coerce_date)
 
     history_starts: list[date] = []
     non_cash_histories: dict[str, pd.DataFrame] = {}
@@ -612,15 +760,23 @@ def build_holdings_portfolio_window(
         asset_type = str(row.get("Type", "")).strip().lower()
         quantity = row.get("Quantity") or 0.0
         buy_date = row.get("Buy Date")
+        sell_date = row.get("Sell Date")
 
         if not ticker or quantity <= 0:
             continue
-
-        active_start = effective_start if assume_full_period else max(effective_start, buy_date) if buy_date else effective_start
-        if active_start > end_date:
+        if reconstruct_cash and asset_type == "cash":
             continue
 
-        asset_index = _session_index(active_start, end_date)
+        active_start = effective_start if assume_full_period else max(effective_start, buy_date) if buy_date else effective_start
+        active_end = min(end_date, sell_date) if sell_date else end_date
+        if active_start > active_end:
+            continue
+
+        asset_index = _session_index(active_start, active_end)
+        if reconstruct_cash and sell_date:
+            asset_index = asset_index[asset_index < pd.Timestamp(sell_date)]
+            if asset_index.empty:
+                continue
 
         if asset_type == "cash":
             asset_value = pd.Series(quantity * CASH_PRICE, index=asset_index, dtype="float64")
@@ -643,9 +799,13 @@ def build_holdings_portfolio_window(
 
             first_price_date = close_series.index.min().date()
             active_start = max(active_start, first_price_date)
-            if active_start > end_date:
+            if active_start > active_end:
                 continue
-            asset_index = _session_index(active_start, end_date)
+            asset_index = _session_index(active_start, active_end)
+            if reconstruct_cash and sell_date:
+                asset_index = asset_index[asset_index < pd.Timestamp(sell_date)]
+                if asset_index.empty:
+                    continue
             aligned_close = _align_close_series(close_series, asset_index)
             aligned_dividends = dividends.reindex(asset_index, fill_value=0.0)
             asset_value = aligned_close * quantity
@@ -662,6 +822,17 @@ def build_holdings_portfolio_window(
             asset_reinvested_value,
             fill_value=0.0,
         )
+
+    if reconstruct_cash:
+        cash_history = _reconstruct_cash_history(
+            holdings,
+            load_portfolio_trade_cash_flows(),
+            full_index,
+            end_date,
+        )
+        total_value = total_value.add(cash_history, fill_value=0.0)
+        total_reinvested_value = total_reinvested_value.add(cash_history, fill_value=0.0)
+        total_income = total_income.add(cash_history * CASH_YIELD / 365.0, fill_value=0.0)
 
     monthly_income = total_income.resample("ME").sum()
     monthly_income = monthly_income.loc[monthly_income.index <= pd.Timestamp(end_date)]
@@ -846,6 +1017,8 @@ def format_income_by_month_for_display(income_table: pd.DataFrame) -> pd.DataFra
 
 def refresh_holdings_analysis_data() -> None:
     load_portfolio_holdings.clear()
+    load_portfolio_sold.clear()
+    load_portfolio_trade_cash_flows.clear()
     build_holdings_analysis_table.clear()
     build_holdings_ticker_details.clear()
     build_holdings_portfolio_histories.clear()

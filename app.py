@@ -1026,6 +1026,8 @@ def render_holdings_summary() -> None:
         window_start,
         window_end,
         assume_full_period=False,
+        include_sold=True,
+        reconstruct_cash=True,
     )
     if not portfolio_value_history.empty:
         st.divider()
@@ -1034,8 +1036,9 @@ def render_holdings_summary() -> None:
             build_holdings_portfolio_chart(
                 portfolio_value_history,
                 monthly_income_history,
-                title="Holdings Portfolio - Current Holdings Since Recorded Buy Dates (Estimated)",
+                title="Holdings Portfolio - Holdings and Sold Activity (Estimated)",
                 show_income_bars=not lookback_exceeds_years(current_lookback(), 2),
+                show_reinvested_value=False,
             ),
             width="stretch",
         )

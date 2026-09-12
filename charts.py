@@ -381,6 +381,7 @@ def build_holdings_portfolio_chart(
     title: str = "Holdings Portfolio - Total Value and Monthly Income",
     show_income_bars: bool = True,
     benchmark_history: pd.Series | None = None,
+    show_reinvested_value: bool = True,
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     bar_width_ms = _bar_width_ms(portfolio_value_history.index)
@@ -395,7 +396,7 @@ def build_holdings_portfolio_chart(
         ),
         secondary_y=False,
     )
-    if "Reinvested Portfolio Value" in portfolio_value_history.columns:
+    if show_reinvested_value and "Reinvested Portfolio Value" in portfolio_value_history.columns:
         fig.add_trace(
             go.Scatter(
                 x=portfolio_value_history.index,
@@ -425,9 +426,12 @@ def build_holdings_portfolio_chart(
         for value in monthly_income_history["Income"].fillna(0.0)
     ]
     if show_income_bars:
+        income_bar_dates = pd.DatetimeIndex(
+            [period.to_timestamp() + pd.Timedelta(days=14) for period in monthly_income_history.index.to_period("M")]
+        )
         fig.add_trace(
             go.Bar(
-                x=monthly_income_history.index,
+                x=income_bar_dates,
                 y=monthly_income_history["Income"],
                 name="Estimated Monthly Income",
                 marker=dict(color="rgba(52, 211, 153, 0.55)"),
@@ -437,7 +441,8 @@ def build_holdings_portfolio_chart(
                 constraintext="none",
                 cliponaxis=False,
                 width=bar_width_ms,
-                hovertemplate="Estimated Monthly Income=$%{y:,.2f}<extra></extra>",
+                customdata=monthly_income_history.index.strftime("%B %Y"),
+                hovertemplate="%{customdata}<br>Estimated Monthly Income=$%{y:,.2f}<extra></extra>",
             ),
             secondary_y=True,
         )
