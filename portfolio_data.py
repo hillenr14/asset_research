@@ -19,8 +19,8 @@ PORTFOLIO_SOLD_SHEET_NAME = "Sold"
 PORTFOLIO_CACHE_TTL_SECONDS = 86400
 PORTFOLIO_SOURCE_COLUMNS = ["Ticker", "Type", "Loc", "Quantity", "Buy date", "Bought at"]
 PORTFOLIO_HISTORY_SHEETS = {
-    "401K": ("history_401k_import", "Date", "Net Amount", "Activity Description", "A1:M"),
-    "VG": ("Holdings VG import", "Trade Date", "Net Amount", "Transaction Type", "A1:M"),
+    "401K": ("History 401k", "Date", "Net Amount", "Activity Description", "A1:M"),
+    "VG": ("Holdings VG", "Trade Date", "Net Amount", "Transaction Type", "A1:M"),
     "CS": ("History CS ", "Date", "Amount", "Action", "A1:H"),
 }
 CASH_PRICE = 1.0
